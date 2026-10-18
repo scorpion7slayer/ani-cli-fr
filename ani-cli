@@ -8,34 +8,114 @@ version_number="5.1.5"
 # $1 = prompt, $2 = multi select flag (for fzf/rofi), $3 = extra flags by user
 menu() {
     case "$menu_program" in
-        fzf) fzf --reverse --cycle --prompt "$1" $2 $3 ;;
+        fzf) fzf_menu "$@" ;;
         rofi) rofi -sort -dmenu -i -p "$1" $2 $3 ;;
         dmenu) dmenu -l 20 -p "$1" $3 ;;
         *) "$menu_program" $3 "$1" ;;
     esac
 }
 
-# provide menu. input format is either (ep_list) or (number \t anime_id \t anime_name)
-nth() {
-    _stdin=$(cat -)
+# input lines are (value \t label [\t hidden fields]) and only the label is shown.
+# frames, labels and previews need newer fzf releases, older ones keep the plain look.
+# menu_header, menu_preview and menu_start (the line the cursor starts on) tune the next menu
+# shellcheck disable=SC2086
+fzf_menu() {
+    _prompt="$1"
+    _multi="$2"
+    _extra="$3"
+    printf "\33[2K\r" >&2
+    set -- --ansi --reverse --cycle --delimiter="	" --with-nth=2
+    if [ "$fzf_level" -ge 1 ]; then
+        set -- "$@" --height="${ANI_CLI_FZF_HEIGHT:-90%}" --border=rounded --info=inline --pointer="▶" --marker="✓" \
+            --color="fg+:bold,bg+:-1,hl:5,hl+:5,pointer:5,marker:2,prompt:6,header:4,info:8,border:8,spinner:5"
+        [ -n "$menu_header" ] && set -- "$@" --header="$menu_header"
+        [ -n "$menu_preview" ] && set -- "$@" --preview="$menu_preview" --preview-window="right:45%:wrap"
+        [ "$fzf_gutter" = 1 ] && set -- "$@" --gutter=" "
+    fi
+    if [ "$fzf_level" -ge 2 ]; then
+        # short menus shrink to their content, a later --height wins over the first one
+        [ -z "$menu_preview" ] && [ -z "${ANI_CLI_FZF_HEIGHT:-}" ] && set -- "$@" --height="~90%"
+        set -- "$@" --prompt="❯ " --border-label=" $_prompt " --border-label-pos=3 --color="label:5:bold"
+        [ -n "$menu_start" ] && set -- "$@" --bind="load:pos($menu_start)"
+    else
+        set -- "$@" --prompt="$_prompt : "
+    fi
+    fzf "$@" $_multi $_extra
+}
+
+fzf_setup() {
+    _version="$(fzf --version 2>/dev/null)"
+    case "$_version" in
+        0.*)
+            _minor="${_version#0.}"
+            _minor="${_minor%%[!0-9]*}"
+            ;;
+        [1-9]*) _minor=999 ;;
+        *) _minor=0 ;;
+    esac
+    fzf_level=0
+    [ "${_minor:-0}" -ge 29 ] && fzf_level=1
+    [ "${_minor:-0}" -ge 36 ] && fzf_level=2
+    # recent releases draw a gutter column next to the pointer, it only adds noise here
+    fzf_gutter=0
+    _status=0
+    fzf --gutter=" " --filter="" </dev/null >/dev/null 2>&1 || _status=$?
+    [ "$_status" -ne 2 ] && fzf_gutter=1
+}
+
+# prints the values of the chosen (value \t label) lines, a lone line is chosen without asking
+# $1 = prompt, $2 = multi select flag
+choose() {
+    _stdin="$(cat -)"
     [ -z "$_stdin" ] && return 1
     _line_count="$(printf "%s\n" "$_stdin" | wc -l | tr -d "[:space:]")"
-    [ "$_line_count" -eq 1 ] && printf "%s" "$_stdin" | cut -f 2,3 && return 0
-    _prompt="$1"
-    [ $# -ne 1 ] && _multi_flag="$2"
-    _line=$(printf "%s" "$_stdin" | cut -f 1,3 | tr '\t' ' ' | menu "$_prompt" "$_multi_flag" "$menu_extra_flags" | cut -d " " -f 1)
-    _line_start=$(printf "%s" "$_line" | head -n 1)
-    _line_end=$(printf "%s" "$_line" | tail -n 1)
-    [ -n "$_line" ] || return 1
-    if [ "$_line_start" = "$_line_end" ]; then
-        printf "%s" "$_stdin" | grep -E '^'"${_line}"'($|[[:space:]])' | cut -f 2,3 || return 1
-    else
-        printf "%s" "$_stdin" | sed -n '/^'"${_line_start}"'$/,/^'"${_line_end}$"'/p' || return 1
+    [ "$_line_count" -eq 1 ] && printf "%s\n" "$_stdin" | cut -f 1 && return 0
+    if [ "$tui" = 1 ]; then
+        ui_reset "$1"
+        [ -n "$2" ] && ui_multi=1
+        [ -n "$menu_preview" ] && ui_pv_cmd="--preview"
+        # long lists can be filtered by typing
+        [ "$_line_count" -gt 12 ] && ui_input=1
+        ui_start="${menu_start:-1}"
+        ui_header="$(tui_take_notice)"
+        [ -n "$menu_header" ] && ui_header="${ui_header:+$ui_header
+}$menu_header"
+        _out="$(printf "%s\n" "$_stdin" | ui_menu)"
+        case "$_out" in
+            @home) kill -USR2 "$$" && return 1 ;;
+            @quit) kill -USR1 "$$" && return 1 ;;
+            *) ;;
+        esac
+        [ -n "$_out" ] && printf "%s\n" "$_out" | cut -f 1
+        return 0
     fi
+    if [ "$menu_program" = "fzf" ]; then
+        _out="$(printf "%s\n" "$_stdin" | menu "$1" "$2" "$menu_extra_flags")"
+        # the footer buttons of the full screen interface
+        case "$_out" in
+            @home) kill -USR2 "$$" && return 1 ;;
+            @quit) kill -USR1 "$$" && return 1 ;;
+            *) ;;
+        esac
+        [ -n "$_out" ] && printf "%s\n" "$_out" | cut -f 1
+        return 0
+    fi
+    # other menus get the bare labels, the chosen ones are matched back to their line
+    _labels="$(printf "%s\n" "$_stdin" | cut -f 2)"
+    printf "%s\n" "$_labels" | menu "$1" "$2" "$menu_extra_flags" | while IFS= read -r _label; do
+        _n="$(printf "%s\n" "$_labels" | grep -n -F -x -- "$_label" | head -n 1 | cut -d : -f 1)"
+        [ -n "$_n" ] && printf "%s\n" "$_stdin" | sed -n "${_n}p" | cut -f 1
+    done
 }
 
 die() {
-    printf "\33[2K\r\033[1;31m%s\033[0m\n" "$*" >&2
+    if [ "$tui" = 1 ]; then
+        # the message is printed once the full screen is left, from a subshell the main shell is asked to stop
+        printf "\033[1;31m✕ %s\033[0m\n" "$*" >>"$tui_dir/fatal"
+        kill -USR1 "$$"
+        exit 1
+    fi
+    printf "\33[2K\r\033[1;31m✕ %s\033[0m\n" "$*" >&2
     exit 1
 }
 
@@ -43,60 +123,131 @@ info() {
     printf "\33[2K\r\033[1;34m%s\033[0m\n" "$*"
 }
 
-help_info() {
-    printf "
-    Usage:
-    %s [options] [query]
-    %s [query] [options]
-    %s [options] [query] [options]
+# in the full screen interface warnings and notes wait for the header of the next menu
+warn() {
+    if [ "$tui" = 1 ]; then
+        printf "\033[33m! %s\033[0m\n" "$*" >>"$tui_dir/notice"
+        return 0
+    fi
+    printf "\33[2K\r\033[1;33m! %s\033[0m\n" "$*" >&2
+}
 
-    Options:
-      -c, --continue
-        Continue watching from history
-      -d, --download
-        Download the video instead of playing it
-      -D, --delete
-        Delete history
-      -l, --logview
-        Show logs
-      -s, --syncplay
-        Use Syncplay to watch with friends
-      -S, --select-nth
-        Select nth entry
-      -q, --quality
-        Specify the video quality
-      -v, --vlc
-        Use VLC to play the video
-      -V, --version
-        Show the version of the script
-      -h, --help
-        Show this help message and exit
-      -e, --episode, -r, --range
-        Specify the number of episodes to watch
-      --dub
-        Play dubbed version
-      --rofi
-        Use rofi instead of fzf for the interactive menu
-      --dmenu
-        Use dmenu instead of fzf for the interactive menu
-      --skip
-        Use ani-skip to skip the intro of the episode (mpv only)
-      --no-detach
-        Don't detach the player (useful for in-terminal playback, mpv only)
-      --exit-after-play
-        Exit the player, and return the player exit code (useful for non interactive scenarios)
-      -N, --nextep-countdown
-        Display a countdown to the next episode
-      -U, --update
-        Update the script
-    Some example usages:
-      %s -q 720p banana fish
-      %s --skip -S 2 one piece
-      %s -d -e 2 cyberpunk edgerunners
-      %s --vlc cyberpunk edgerunners -q 1080p -e 4
-      %s blue lock -e 5-6
-      %s -e \"5 6\" blue lock
-    \n" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}"
+note() {
+    if [ "$tui" = 1 ]; then
+        printf "\033[2m%s\033[0m\n" "$*" >>"$tui_dir/notice"
+        return 0
+    fi
+    printf "\33[2K\r\033[2m%s\033[0m\n" "$*" >&2
+}
+
+# transient message, the next message or menu replaces it
+status() {
+    if [ "$tui" = 1 ]; then
+        ui_loading_screen "$*"
+        return 0
+    fi
+    printf "\33[2K\r\033[2m%s\033[0m" "$*" >&2
+}
+
+banner() {
+    printf "\n  \033[1;35mani-cli\033[0;35m-fr\033[0m  \033[2mv%s  ·  animes en VOSTFR et en VF  ·  anime-sama + franime\033[0m\n\n" "$version_number"
+}
+
+# name of a version, from the season when the site gives one
+lang_label() {
+    _found="$(printf "%s" "$lang_list" | sed -n "s|^$1	||p" | head -n 1)"
+    [ -n "$_found" ] && printf "%s" "$_found" && return 0
+    case "$1" in
+        vostfr) printf "VOSTFR" ;;
+        vf) printf "VF" ;;
+        vf*) printf "VF %s" "${1#vf}" ;;
+        *) printf "%s" "$1" ;;
+    esac
+}
+
+help_info() {
+    _n="${0##*/}"
+    _b="" _d="" _r=""
+    if [ -t 1 ]; then
+        _b="$(printf '\033[1;35m')" _d="$(printf '\033[2m')" _r="$(printf '\033[0m')"
+    fi
+    cat <<EOF
+${_b}ani-cli-fr${_r} ${_d}${version_number}${_r} · animes en VOSTFR et en VF depuis anime-sama et franime
+
+${_b}Utilisation${_r}
+  $_n [options] [recherche]
+  $_n help                   afficher cette aide (aussi -h, --help)
+
+  Sans argument, l'interface plein écran s'ouvre : accueil, recherche en direct,
+  historique, paramètres et aide, à la souris ou au clavier. Avec une recherche,
+  elle s'ouvre directement sur les résultats.
+
+${_b}Recherche et lecture${_r}
+  -e, --episode, -r, --range N   épisode(s) à regarder : 5, 5-8 ou "5 6"
+  -S, --select-nth N             prendre le N-ième résultat de la recherche
+  -q, --quality Q                qualité : best (défaut), worst, 1080p, 720p…
+  -c, --continue                 reprendre un anime de l'historique
+  -N, --nextep-countdown         temps restant avant le prochain épisode
+
+${_b}Langue et version${_r}
+  --vf, --dub                    VF sans demander (s'il y en a plusieurs, elles sont proposées)
+  --vostfr, --sub                VOSTFR sans demander
+  ANI_CLI_MODE=vf2               une version précise : vostfr, vf, vf1, vf2…
+  ${_d}Sans option, le menu de langue liste toutes les versions de la saison
+  (ex. VOSTFR, VF Crunchyroll, VF Netflix) avec leur nombre d'épisodes.${_r}
+
+${_b}Sites${_r}
+  -p, --provider SITE            all (défaut), animesama ou franime
+  ${_d}Si un anime, un épisode ou une source manque, les menus proposent
+  de chercher sur l'autre site.${_r}
+
+${_b}Lecteur vidéo${_r}
+  -v, --vlc                      lire avec VLC
+  -s, --syncplay                 regarder à plusieurs avec Syncplay
+  -d, --download                 télécharger au lieu de lire
+  --skip                         passer l'intro avec ani-skip (mpv uniquement)
+  --no-detach                    garder le lecteur attaché au terminal (mpv uniquement)
+  --exit-after-play              quitter après la lecture avec le code du lecteur
+
+${_b}Menus${_r}
+  --rofi, --dmenu                utiliser rofi ou dmenu au lieu de fzf
+  ${_d}Dans fzf : tapez pour filtrer, ↑/↓ pour naviguer, Entrée pour valider,
+  Tab pour sélectionner plusieurs épisodes, Échap pour revenir ou quitter.${_r}
+
+${_b}Menu de lecture${_r}
+  suivant, rejouer, précédent, choisir un épisode, changer de version,
+  changer de lecteur (les deux sites en proposent souvent plusieurs),
+  changer de qualité, regarder sur l'autre site, quitter.
+
+${_b}Divers${_r}
+  -l, --logview                  afficher les logs
+  -D, --delete                   effacer l'historique
+  -U, --update                   mettre à jour le script
+  -V, --version                  afficher la version
+
+${_b}Variables d'environnement${_r}
+  ANI_CLI_PLAYER                 lecteur à utiliser : mpv, iina, vlc…
+  ANI_CLI_PROVIDER               site par défaut (comme -p)
+  ANI_CLI_QUALITY                qualité par défaut (comme -q)
+  ANI_CLI_DOWNLOAD_DIR           dossier des téléchargements
+  ANI_CLI_HIST_DIR               dossier de l'historique
+  ANI_CLI_CACHE_DIR              dossier du cache
+  ANI_CLI_ANIMESAMA_URL          domaine anime-sama à utiliser sans passer par anime-sama.pw
+  ANI_CLI_FZF_HEIGHT             hauteur des menus fzf classiques (défaut 90%)
+  ANI_CLI_TUI=0                  ne pas utiliser l'interface plein écran
+  ANI_CLI_ANIMATIONS=0           couper les animations de l'interface plein écran
+  ANI_CLI_CONFIG                 fichier des paramètres (défaut ~/.config/ani-cli-fr/config)
+
+${_b}Exemples${_r}
+  $_n                               ouvrir l'interface plein écran
+  $_n frieren                       chercher et tout choisir dans les menus
+  $_n --vf dandadan -e 2            épisode 2 en VF
+  ANI_CLI_MODE=vf2 $_n dandadan     directement la deuxième VF (ici Netflix)
+  $_n -p franime blue lock -e 5-6   épisodes 5 et 6 sur franime
+  $_n -q 720p -S 2 one piece        deuxième résultat, en 720p
+  $_n -d -e "1 2" cyberpunk         télécharger les épisodes 1 et 2
+  $_n -c                            reprendre là où vous en étiez
+EOF
     exit 0
 }
 
@@ -108,19 +259,19 @@ version_info() {
 # Bookkeeping
 
 update_script() {
-    info "[branch:$branch] Checking for Update.."
-    update="$($curl_exe --fail-with-body -sL -A "$agent" "https://raw.githubusercontent.com/pystardust/ani-cli/$branch/ani-cli")" || die "[branch:$branch] Connection error: $update"
+    info "[branche:$branch] Recherche de mise à jour.."
+    update="$($curl_exe --fail-with-body -sL -A "$agent" "https://raw.githubusercontent.com/scorpion7slayer/ani-cli-fr/$branch/ani-cli")" || die "[branche:$branch] Erreur de connexion : $update"
     new_version="$(printf "%s" "$update" | sed -nE 's|^version_number="([^"]+)"$|\1|p')"
-    [ -z "$new_version" ] && die "[branch:$branch] Invalid response."
-    printf "%s" "$update" | grep -q "^version_number" || die "[branch:$branch] Invalid response."
+    [ -z "$new_version" ] && die "[branche:$branch] Réponse invalide."
+    printf "%s" "$update" | grep -q "^version_number" || die "[branche:$branch] Réponse invalide."
     update="$(printf "%s\n" "$update" | diff -u "$0" -)"
     if [ -z "$update" ]; then
-        info "[branch:$branch] Script is up to date :) ($version_number)"
+        info "[branche:$branch] Le script est à jour :) ($version_number)"
     else
         if printf "%s\n" "$update" | patch "$0" -; then
-            info "[branch:$branch] Updated: $version_number -> $new_version"
+            info "[branche:$branch] Mis à jour : $version_number -> $new_version"
         else
-            die "[branch:$branch] Failed to update. Read the above line!"
+            die "[branche:$branch] Échec de la mise à jour. Lisez la ligne ci-dessus !"
         fi
     fi
     exit 0
@@ -128,7 +279,7 @@ update_script() {
 
 # checks if dependencies are present
 dep_ch() {
-    command -v "$1" >/dev/null || die "Program $1 not found. Please install it."
+    command -v "$1" >/dev/null || die "Programme $1 introuvable. Veuillez l'installer."
 }
 
 # checks for deps in order and returns the first available. format is "prog_a,prog_b,prog_c"
@@ -149,30 +300,16 @@ cleanup() {
 
 # SCRAPING
 
+# prints the body of $1 (extra curl flags may follow), fails on connection errors and non 2xx answers
 #shellcheck disable=SC2086
-hianime_curl() {
-    _curl_status=0
-    _response="$($curl_exe -sL -A "$agent" --max-time 10 $cipher_flag \
-        -w ' %{http_code}' "$@")" || _curl_status=$?
-
+fetch() {
+    _response="$($curl_exe -sL -A "$agent" --max-time 15 $cipher_flag -w ' %{http_code}' "$@")" || return 1
     _http_code=${_response##* }
-    _response=${_response% *}
-
-    if [ "$_curl_status" -ne 0 ]; then
-        case "$_http_code" in
-            [1-5][0-9][0-9]) _detail="HTTP $_http_code" ;;
-            *) _detail="no HTTP response" ;;
-        esac
-        die "Connection error: could not fetch $1 ($_detail; curl exit $_curl_status)"
-    fi
-
+    printf "%s" "${_response% *}"
     case "$_http_code" in
-        2??) ;;
-        *) printf "%s" "$_response" | grep -qi "Just a moment" ||
-            die "Request failed: HTTP $_http_code from $1" ;;
+        2??) return 0 ;;
+        *) return 1 ;;
     esac
-
-    printf "%s" "$_response"
 }
 
 # GNU, BSD and openssl spell base64 decoding differently
@@ -180,65 +317,579 @@ b64_decode() {
     printf "%s\n" "$1" | base64 -d 2>/dev/null || printf "%s\n" "$1" | base64 -D 2>/dev/null || printf "%s\n" "$1" | openssl base64 -d -A 2>/dev/null
 }
 
-# the embed page ships its config as base64(json XOR "otaku-embed-v1"), this prints the json.
-# runs in a subshell so the key bytes can live in the positional parameters and rotate with shift.
-deobfuscate_blob() (
-    _bytes="$(b64_decode "$1" | od -v -An -tu1)"
-    set -- 111 116 97 107 117 45 101 109 98 101 100 45 118 49
+html_decode() {
+    sed -e "s|&#0*39;|'|g" -e 's|&quot;|"|g' -e 's|&lt;|<|g' -e 's|&gt;|>|g' -e "s|&amp;|\&|g"
+}
+
+str_rev() {
+    if command -v rev >/dev/null; then
+        rev
+    else
+        fold -w 1 | sed -n '1!G;h;$p' | tr -d '\n'
+    fi
+}
+
+url_origin() {
+    printf "%s" "$1" | sed -E 's|^(https?://[^/]*).*|\1/|'
+}
+
+# undoes the "eval(function(p,a,c,k,e,d)" packer: every word of p is an index written in base a into the k list.
+# words are put on their own lines so that a generated sed script can swap them one by one.
+unpack_js() (
+    _flat="$(printf "%s" "$1" | tr -d '\n')"
+    _re=".*return p[}]\('(.*)',([0-9]+),([0-9]+),'([^']*)'\.split\('\|'\).*"
+    _base="$(printf "%s" "$_flat" | sed -nE "s/$_re/\2/p")"
+    [ -n "$_base" ] && [ "$_base" -le 62 ] || exit 1
+    # & and \ are special in a sed replacement
+    _words="$(printf "%s" "$_flat" | sed -nE "s/$_re/\4/p" | sed 's/[\\&]/\\&/g' | tr '|' '\n')"
+    set -- 0 1 2 3 4 5 6 7 8 9 a b c d e f g h i j k l m n o p q r s t u v w x y z A B C D E F G H I J K L M N O P Q R S T U V W X Y Z
+    _nl='
+'
+    _script=""
+    _i=0
+    while IFS= read -r _word; do
+        if [ -n "$_word" ]; then
+            _n=$_i
+            _digit=""
+            _token=""
+            while :; do
+                eval "_digit=\${$((_n % _base + 1))}"
+                _token="$_digit$_token"
+                _n=$((_n / _base))
+                [ "$_n" -eq 0 ] && break
+            done
+            _script="${_script}s|^${_token}\$|${_word}|${_nl}t${_nl}"
+        fi
+        _i=$((_i + 1))
+    done <<EOF
+$_words
+EOF
+    printf "%s" "$_flat" | sed -nE "s/$_re/\1/p" | sed "s/\\\\'/'/g" | sed 's/\([0-9A-Za-z_][0-9A-Za-z_]*\)/\
+\1\
+/g' | sed "$_script" | tr -d '\n'
+)
+
+# voe hides its config as base64(reverse(shift3(base64(rot13 + junk markers))))
+voe_decode() {
+    _step="$(printf "%s" "$1" | tr 'A-Za-z' 'N-ZA-Mn-za-m' | sed 's/@\$//g; s/\^\^//g; s/~@//g; s/%?//g; s/\*~//g; s/!!//g; s/#&//g')"
+    _step="$(b64_decode "$_step" | LC_ALL=C tr '#-~' ' -{' | str_rev)"
+    b64_decode "$_step"
+}
+
+# franime hides the embed url as base64(hex(url XOR key)), the one byte key comes from the leading "h" of http
+fr_decode() (
+    _hex="$(b64_decode "$1")"
+    case "$_hex" in
+        "" | *[!0-9a-fA-F]*) exit 1 ;;
+        *) ;;
+    esac
+    _key=$((0x${_hex%"${_hex#??}"} ^ 104))
     _output=""
-    for _byte in $_bytes; do
-        _char=$((_byte ^ $1))
+    while [ -n "$_hex" ]; do
+        _char=$((0x${_hex%"${_hex#??}"} ^ _key))
+        _hex=${_hex#??}
         _output="${_output}\\0$((_char / 64))$(((_char / 8) % 8))$((_char % 8))"
-        set -- "$@" "$1"
-        shift
     done
     printf "%b" "$_output"
 )
 
-# search the query and give results. format is (id \t name)
-hianime_search() {
-    #shellcheck disable=SC2059
-    _page="$(hianime_curl "$(printf "$search_api" "$1")")" || return 1
-    if printf "%s" "$_page" | grep -qi "<title>Just a moment"; then
-        [ "$curl_exe" = "curl" ] && die "Blocked by cloudflare. Try installing curl-impersonate"
-        die "Blocked by cloudflare."
-    fi
-    # the top 10 sidebar repeats the result markup, cut it off before flattening the page
-    printf "%s" "$_page" | sed '/id="main-sidebar"/,$d' | tr '\n' ' ' | sed 's|<div class="film-detail">|\n<div class="film-detail">|g' |
-        sed -nE 's|.*<h3 class="film-name">[[:space:]]*<a href="[^"]*/([^"/]*)"[[:space:]]*title="([^"]*)".*|\1\t\2|p' |
-        sed -e "s|&#039;|'|g" -e 's|&quot;|"|g' -e "s|&amp;|\&|g"
-}
-
-# get the episodes list of the selected anime. format is (id \t ep_no)
-hianime_episodes() {
-    #shellcheck disable=SC2059
-    _page="$(hianime_curl "$(printf "$episodes_api" "${1##*-}")")" || return 1
-    # ids from the v5.0 provider have the same shape, so check the slug in the episode links too
-    printf "%s" "$_page" | sed 's|\\||g; s|ep-item|\nep-item|g' |
-        sed -nE "s|.*data-number=\"([^\"]*)\".*data-id=\"([0-9]+)\".*/watch/${1}[?]ep=.*|\\2\\t\\1|p"
-}
-
-# resolves episode $1 in mode $2 (sub/dub): sets links (quality >url per line), sub_link, mal_id and refr
-hianime_m3u8() {
-    _ep_id=$(printf "%s" "$episode_maps" | sed -nE "s|^([0-9]+)\t${1}$|\1|p")
-    #shellcheck disable=SC2059
-    _servers="$(hianime_curl "$(printf "$servers_api" "$_ep_id")" | sed 's|\\"|"|g; s|server-item|\nserver-item|g')"
-    # only the zokoanime embed is understood by deobfuscate_blob, the other servers use different players
-    _hash="$(printf "%s\n" "$_servers" | sed -nE 's|.*data-type="'"$2"'".*data-server-name="ZokoAnime".*data-hash="([^"]*)".*|\1|p' | head -n 1)"
-    _embed="$(b64_decode "$_hash")"
-    [ -z "$_embed" ] && return 1
-    # the stream host wants the embed site as referer, and the embed url carries the mal id for ani-skip
-    refr="$(printf "%s" "$_embed" | sed -E 's|^(https?://[^/]*).*|\1/|')"
-    mal_id="$(printf "%s" "$_embed" | sed -nE 's|.*/mal/([0-9]+)/.*|\1|p')"
-    _blob="$(hianime_curl "$_embed" | sed -nE 's|.*window\.__P="([^"]*)".*|\1|p')"
-    [ -z "$_blob" ] && return 1
-    _json="$(deobfuscate_blob "$_blob")"
-    _m3u8_master="$(printf "%s" "$_json" | sed -nE 's|.*"src":"([^"]*\.m3u8[^"]*)".*|\1|p')"
-    [ -z "$_m3u8_master" ] && return 1
-    sub_link="$(printf "%s" "$_json" | sed 's|.*"subtitles":\[||; s|}\].*||; s|},{|}\n{|g' | grep -m 1 '"default":true' | sed -nE 's|.*"src":"([^"]*)".*|\1|p')"
-    # quality variants are relative to the master playlist
-    links="$(hianime_curl "$_m3u8_master" -e "$refr" | sed 's|^#EXT-X-STREAM.*x||g; s|,.*|p|g; /^#/d; $!N; s|\n| >|;/EXT-X-I-FRAME/d' | sed "\|>https*://|!s|>|>${_m3u8_master%/*}/|" | sort -g -r -s)"
+# turns an hls master playlist into (quality >url) lines
+parse_master() {
+    _master="$(fetch "$1" -e "$refr")" || return 1
+    case "$_master" in
+        *"#EXT-X-STREAM-INF"*) ;;
+        *"#EXTM3U"*) links="auto >$1" && return 0 ;;
+        *) return 1 ;;
+    esac
+    _dir="${1%%\?*}"
+    _dir="${_dir%/*}"
+    _origin="$(url_origin "$1")"
+    links="$(printf "%s\n" "$_master" | tr -d '\r' |
+        sed -n '/^#EXT-X-STREAM-INF/{s/.*RESOLUTION=[0-9]*x\([0-9]*\).*/\1p/;s/^#EXT-X-STREAM-INF.*/auto/;h;n;H;x;s/\n/ >/;p;}' |
+        sed -e "s|>/|>${_origin}|" -e "\|>https*://|!s|>|>${_dir}/|" | sort -g -r -s)"
     [ -n "$links" ]
+}
+
+# lower ranks are tried first, 0 means the host is not supported
+host_rank() {
+    case "$1" in
+        *ansembed* | *vidmoly*) _rank=1 ;;
+        *[Ss]moothpre* | *movearnpre* | *minochinos* | *dingtezuni* | *mivalyo* | *bingezove* | *vidhide*) _rank=2 ;;
+        *uqload*) _rank=3 ;;
+        *voe* | *jeremyparticipantanything* | *megankiddifference* | *teresapoliticallearn* | *morencius*) _rank=4 ;;
+        *sibnet*) _rank=5 ;;
+        *sendvid*) _rank=6 ;;
+        *embed4me* | *lpayer* | *filemoon* | *byse* | *oneupload* | vk* | *vk.com* | *INDISPONIBLE* | *TELECHARGEMENT* | *youtube* | "") _rank=0 ;;
+        *) _rank=7 ;;
+    esac
+}
+
+# resolves an embed page into links (quality >url) and its referer, fails when the host gives nothing playable
+extract_embed() {
+    links=""
+    _src=""
+    refr="$(url_origin "$1")"
+    case "$1" in
+        *sendvid.com*)
+            _src="$(fetch "$1" | sed -nE 's|.*og:video"[[:space:]]*content="([^"]*)".*|\1|p' | head -n 1 | html_decode)"
+            ;;
+        *sibnet.ru*)
+            refr="https://video.sibnet.ru/"
+            _src="$(fetch "$1" -e "$site_referer" | sed -nE 's|.*player\.src\(\[\{src: *"([^"]*)".*|\1|p' | head -n 1)"
+            case "$_src" in
+                /*) _src="https://video.sibnet.ru$_src" ;;
+                *) ;;
+            esac
+            ;;
+        *)
+            _page="$(fetch "$1" -e "$site_referer")" || return 1
+            # voe mirrors bounce through a page that only sets location.href
+            _next="$(printf "%s" "$_page" | sed -nE "s|.*window\.location\.href = '(https?://[^']*)'.*|\1|p" | head -n 1)"
+            if [ -n "$_next" ]; then
+                _page="$(fetch "$_next")" || return 1
+                refr="$(url_origin "$_next")"
+            fi
+            _config="$(printf "%s" "$_page" | sed -nE 's|.*<script type="application/json">\["([^"]*)"\]</script>.*|\1|p' | head -n 1)"
+            if [ -n "$_config" ]; then
+                _src="$(voe_decode "$_config" | sed -nE 's|.*"source":"([^"]*)".*|\1|p' | sed 's|\\/|/|g')"
+            else
+                case "$_page" in
+                    *"eval(function(p,a,c,k,e,d)"*) _page="$_page$(unpack_js "$_page")" ;;
+                    *) ;;
+                esac
+                _src="$(printf "%s" "$_page" | grep -oE "https?://[^\"' ]+\.m3u8[^\"' ]*" | head -n 1)"
+                [ -z "$_src" ] && _src="$(printf "%s" "$_page" | grep -oE "https?://[^\"' ]+\.mp4[^\"' ]*" | head -n 1)"
+            fi
+            ;;
+    esac
+    case "$_src" in
+        "") return 1 ;;
+        *.m3u8*) parse_master "$_src" ;;
+        *)
+            # some hosts answer with a few seconds long placeholder instead of the episode
+            #shellcheck disable=SC2086
+            _size="$($curl_exe -sIL -A "$agent" -e "$refr" --max-time 15 $cipher_flag "$_src" | tr -d '\r' | sed -n 's|^[Cc]ontent-[Ll]ength: *||p' | tail -n 1)"
+            [ -n "$_size" ] && [ "$_size" -lt 1000000 ] && return 1
+            links="mp4 >$_src"
+            ;;
+    esac
+    [ -n "$links" ]
+}
+
+# anime-sama changes its domain often, anime-sama.pw always links to the current one
+as_resolve_domain() {
+    [ -n "$as_base" ] && return 0
+    _cache="$cache_dir/anime-sama-domain"
+    _fresh="$(find "$_cache" -mtime -1 2>/dev/null)"
+    if [ -n "$_fresh" ]; then
+        as_base="$(cat "$_cache")"
+        [ -n "$as_base" ] && return 0
+    fi
+    _link="$(fetch "https://anime-sama.pw/" | sed -nE 's|.*class="btn-primary" href="(https?://[^"]*)".*|\1|p' | head -n 1)"
+    [ -z "$_link" ] && _link="https://anime-sama.to"
+    #shellcheck disable=SC2086
+    as_base="$($curl_exe -sIL -A "$agent" --max-time 15 $cipher_flag -o /dev/null -w '%{url_effective}' "$_link")"
+    as_base="${as_base%/}"
+    case "$as_base" in
+        https://anime-sama.*) printf "%s" "$as_base" >"$_cache" ;;
+        *) as_base="${_link%/}" ;;
+    esac
+}
+
+# search results, format is (id \t name)
+as_search() {
+    _query="$(printf "%s" "$1" | tr '+' ' ')"
+    _page="$(fetch "$as_base/template-php/defaut/fetch.php" -X POST --data-urlencode "query=$_query")" || return 1
+    printf "%s" "$_page" | sed 's|<a href|\
+<a href|g' | sed 's|</*mark>||g' |
+        sed -nE 's|^<a href="[^"]*/catalogue/([^/"]*)/?"[^>]*class="asn-search-result".*asn-search-result-title">[[:space:]]*([^<]*[^<[:space:]])[[:space:]]*</h3><p class="asn-search-meta">([^<]*)<.*|\1\t\2\t\3|p' |
+        grep -v '	Scans[^	]*$' | sed 's|^\([^	]*\)	\([^	]*\)	.*|as:\1	\2|' | html_decode
+}
+
+# the page of an anime holds its seasons and its details, it is kept an hour for the previews
+as_page() {
+    _file="$cache_dir/previews/as-$1"
+    _fresh="$(find "$_file" -mmin -60 2>/dev/null)"
+    [ -n "$_fresh" ] && cat "$_file" && return 0
+    [ -d "$cache_dir/previews" ] || mkdir -p "$cache_dir/previews"
+    fetch "$as_base/catalogue/$1/" >"$_file.$$" && mv "$_file.$$" "$_file" && cat "$_file"
+    rm -f "$_file.$$"
+}
+
+# one (label  value) line of a preview. printf pads bytes, so the label is measured without the utf-8 continuation bytes
+preview_line() {
+    _width="$(printf "%s" "$1" | LC_ALL=C tr -d "\200-\277" | wc -c | tr -d "[:space:]")"
+    _pad="$(printf "%10s" "" | cut -c "$((_width + 1))-")"
+    # long values go on several lines, under the first one
+    printf "%s\n" "$2" | fold -s -w "$((${FZF_PREVIEW_COLUMNS:-60} - 15))" | {
+        IFS= read -r _first
+        printf "\033[36m%s\033[0m%s %s\n" "$1" "$_pad" "$_first"
+        while IFS= read -r _more; do
+            printf "%11s%s\n" "" "$_more"
+        done
+    }
+}
+
+as_preview() {
+    _page="$(as_page "$1" | tr -d '\r')"
+    [ -z "$_page" ] && printf "Aperçu indisponible\n" && return 0
+    _name="$(printf "%s\n" "$_page" | sed -nE 's|.*id="titreOeuvre"[^>]*>([^<]*)<.*|\1|p' | head -n 1 | html_decode)"
+    _alter="$(printf "%s\n" "$_page" | sed -nE 's|.*id="titreAlter"[^>]*>([^<]*)<.*|\1|p' | head -n 1 | html_decode)"
+    printf "\033[1;35m%s\033[0m\n\033[2m" "$_name"
+    printf "%s\n" "$_alter" | fold -s -w "$((${FZF_PREVIEW_COLUMNS:-63} - 3))"
+    printf "\033[0m\n"
+    # only the anime block of the details, the manga one follows it
+    printf "%s\n" "$_page" | sed -n '/<dl class="oe-infos">/,/<\/dl>/p;/<\/dl>/q' |
+        sed -nE 's|.*<dt>([^<]*)</dt><dd>([^<]*)</dd>.*|\1	\2|p' | html_decode | while IFS="	" read -r _key _value; do
+        preview_line "$_key" "$_value"
+    done
+    _genres="$(printf "%s\n" "$_page" | sed -nE 's|.*class="genre-pill"[^>]*>([^<]*)<.*|\1|p' | html_decode | head -n 8 | tr '\n' ',' | sed 's|,$||;s|,|, |g')"
+    [ -n "$_genres" ] && preview_line "Genres" "$_genres"
+    printf "\n"
+    printf "%s\n" "$_page" | sed -n '/id="synopsisText"/,/<\/p>/p' | tr '\n' ' ' | sed -e 's|<[^>]*>||g' -e 's|^[[:space:]]*||' | html_decode | fold -s -w "$((${FZF_PREVIEW_COLUMNS:-63} - 3))"
+    printf "\n"
+}
+
+# seasons of an anime, format is (id \t season name). commented out panels are dropped first
+as_seasons() {
+    _slug="${1#as:}"
+    as_page "$_slug" | tr '\n' ' ' |
+        sed -e 's|/\*[^*]*\*/||g' -e 's|<!--[[:space:]]*panneauAnime(|<!--(|g' -e 's|//[[:space:]]*panneauAnime(|//(|g' |
+        sed 's|panneauAnime(|\
+panneauAnime(|g' | sed -nE 's|^panneauAnime\("([^"]*)", *"([^"/]*)/[^"]*"\).*|as:'"$_slug"'/\2\t\1|p' | html_decode
+}
+
+# versions of a season, the page lists them in languesDispo and names the other dubs in its title
+as_languages() {
+    _base="$as_base/catalogue/${1#as:}"
+    _codes="$(fetch "$_base/vostfr/" | sed -n 's|.*var languesDispo = \[\([^]]*\)\].*|\1|p' | head -n 1 | tr -d '" ' | tr ',' '\n' | grep -E '^(vostfr|vf[0-9]*)$')"
+    [ -z "$_codes" ] && _codes="vostfr vf"
+    for _code in $_codes; do
+        case "$_code" in
+            vf[0-9]*)
+                _name="$(fetch "$_base/$_code/" | sed -n 's|.*#avOeuvre").html("\([^"]*\)").*|\1|p' | sed -n 's|.*\(VF [^)]*\).*|\1|p' | head -n 1 | html_decode)"
+                printf "%s\t%s\n" "$_code" "${_name:-VF ${_code#vf}}"
+                ;;
+            vf) printf "vf\tVF\n" ;;
+            *) printf "vostfr\tVOSTFR\n" ;;
+        esac
+    done
+}
+
+# every player is an array in episodes.js, the nth url of each array is episode n. format is (ep_no \t urls)
+# $2 is the language code
+as_episodes() {
+    _js="$(fetch "$as_base/catalogue/${1#as:}/$2/episodes.js")" || return 1
+    printf "%s" "$_js" | tr -d '\r\n' | sed 's|var eps[0-9]*[[:space:]]*=[[:space:]]*\[|\
+|g' | sed -e '1d' -e 's|\].*||' | while IFS= read -r _array || [ -n "$_array" ]; do
+        printf "%s\n" "$_array" | tr ',' '\n' | sed "s|[[:space:]'\"]||g" | grep -n ''
+    done | sort -t : -k 1,1n -s | {
+        _prev=""
+        _urls=""
+        while IFS= read -r _line; do
+            _k="${_line%%:*}"
+            _url="${_line#*:}"
+            [ -z "$_url" ] && continue
+            if [ "$_k" = "$_prev" ]; then
+                _urls="$_urls $_url"
+            else
+                [ -n "$_prev" ] && printf "%s\t%s\n" "$_prev" "$_urls"
+                _prev="$_k"
+                _urls="$_url"
+            fi
+        done
+        [ -n "$_prev" ] && printf "%s\t%s\n" "$_prev" "$_urls"
+    }
+}
+
+fr_curl() {
+    fetch "$fr_api/$1" -H "Origin: https://franime.fr" -H "Referer: https://franime.fr/"
+}
+
+# the whole franime catalogue is one big json, it is turned into an index (id \t title \t original title)
+# and a details file (id \t format \t start date \t status \t score \t themes \t description), both kept for a day
+fr_index() {
+    _index="$cache_dir/franime-index"
+    _fresh="$(find "$_index" -mtime -1 2>/dev/null)"
+    [ -n "$_fresh" ] && [ -f "$cache_dir/franime-info" ] && return 0
+    status "Mise à jour du catalogue franime…"
+    _catalogue="$(fr_curl "animes/")" || return 1
+    _lines="$cache_dir/franime-lines"
+    # once the players, seasons and episodes are gone every object left is an anime, one per line
+    printf "%s" "$_catalogue" | sed -e "s|\\\\\"|'|g" -e 's|"lecteurs":\[[^]]*\]||g' -e 's|{"title":"[^"]*","episodes":\[||g' -e 's|{"title":"[^"]*","lang":{||g' |
+        sed 's|\([[,]\){"|\1\
+{"|g' | grep '"id":[0-9]' >"$_lines" || return 1
+    _i=0
+    for _field in 'id":([0-9]+)' 'title":"([^"]*)"' 'titleO":"([^"]*)"' 'format":"?([^,"}]*)' 'startDate":"?([^,"}]*)' 'status":"?([^,"}]*)' 'note":"?([^,"}]*)' 'themes":\[([^]]*)\]' 'description":"([^"]*)"'; do
+        _i=$((_i + 1))
+        sed -E -e "s|.*\"$_field.*|\\1|" -e 't' -e 's|.*||' "$_lines" | tr -d '"' >"$_lines.$_i"
+    done
+    paste "$_lines.1" "$_lines.2" "$_lines.3" | sed 's|^\([0-9]*\)	\([^	]*\)	$|\1	\2	\2|' >"$_index.new"
+    paste "$_lines.1" "$_lines.4" "$_lines.5" "$_lines.6" "$_lines.7" "$_lines.8" "$_lines.9" >"$cache_dir/franime-info"
+    rm -f "$_lines" "$_lines".[0-9]
+    [ -s "$_index.new" ] && mv "$_index.new" "$_index"
+}
+
+fr_search() {
+    fr_index || return 1
+    _results="$(cat "$cache_dir/franime-index")"
+    set -f
+    for _word in $(printf "%s" "$1" | tr '+' ' '); do
+        _results="$(printf "%s\n" "$_results" | grep -i -F -- "$_word")"
+    done
+    set +f
+    [ -z "$_results" ] && return 0
+    # exact titles first, then the titles starting with the query
+    _pattern="$(printf "%s" "$1" | tr '+' ' ' | sed 's/[][\.*^$+?(){}|/]/\\&/g')"
+    _exact="^[0-9]*	${_pattern}	|	${_pattern}\$"
+    _start="^[0-9]*	${_pattern}"
+    {
+        printf "%s\n" "$_results" | grep -i -E "$_exact"
+        printf "%s\n" "$_results" | grep -i -v -E "$_exact" | grep -i -E "$_start"
+        printf "%s\n" "$_results" | grep -i -v -E "$_exact" | grep -i -v -E "$_start"
+    } | sed -n 's|^\([0-9]*\)	\([^	]*\)	.*|fr:\1	\2|p' | head -n 30
+}
+
+fr_preview() {
+    _title="$(grep "^$1	" "$cache_dir/franime-index" | head -n 1)"
+    _details="$(grep "^$1	" "$cache_dir/franime-info" | head -n 1 | tr -d '\r')"
+    [ -z "$_title" ] && printf "Aperçu indisponible\n" && return 0
+    printf "%s\n" "$_title" | cut -f 2,3 | {
+        IFS="	" read -r _name _original
+        printf "\033[1;36m%s\033[0m\n" "$_name"
+        [ "$_original" != "$_name" ] && printf "\033[2m%s\033[0m\n" "$_original"
+    }
+    printf "\n"
+    [ -z "$_details" ] && return 0
+    printf "%s\n" "$_details" | {
+        IFS="	" read -r _id _format _start _status _note _themes _description
+        case "$_format" in
+            TV) _format="Série TV" ;;
+            [Ff]ilm | FILM | movie) _format="Film" ;;
+            OAV | OVA | ova) _format="OAV" ;;
+            [Ss]pecial) _format="Spécial" ;;
+            *) ;;
+        esac
+        case "$_status" in
+            TERMIN*) _status="Terminé" ;;
+            "EN COURS") _status="En cours" ;;
+            *) ;;
+        esac
+        _start="$(printf "%s" "$_start" | sed -nE 's|^([0-9]{4})-([0-9]{2})-([0-9]{2}).*|\3/\2/\1|p')"
+        for _pair in "Format	$_format" "Statut	$_status" "Diffusion	$_start" "Note	${_note:+$_note / 10}" "Genres	$(printf "%s" "$_themes" | sed 's|,|, |g')"; do
+            case "$_pair" in
+                *"	" | *"	null"*) ;;
+                *) preview_line "${_pair%%	*}" "${_pair#*	}" ;;
+            esac
+        done
+        printf "\n%s\n" "$_description" | sed -e 's|\\r||g' -e 's|\\n|\
+|g' -e 's|\\t| |g' | fold -s -w "$((${FZF_PREVIEW_COLUMNS:-63} - 3))"
+    }
+}
+
+fr_lang() {
+    case "$1" in
+        vf) printf "vf" ;;
+        *) printf "vo" ;;
+    esac
+}
+
+# the json of the chosen anime is kept in memory, seasons and both languages come from it
+fr_cache_anime() {
+    [ "$fr_json_id" = "$1" ] && return 0
+    fr_json="$(fr_curl "anime-by-id/$1")" || return 1
+    fr_json_id="$1"
+}
+
+# S lines are seasons, E lines are episodes followed by their players in the language $2 (vo or vf)
+fr_anime() {
+    fr_cache_anime "$1" || return 1
+    printf "%s" "$fr_json" | sed "s|\\\\\"|'|g" | sed 's|{"title":"|\
+@|g' | sed -n -e 's|^@\([^"]*\)","episodes":\[.*|S\1|p' \
+        -e '/^@[^"]*","lang":{/{s|.*"'"$2"'":{"lecteurs":\[\([^]]*\)\].*|E\1|p' -e 't' -e 's|.*|E|p' -e '}' | tr -d '"'
+}
+
+fr_seasons() {
+    _i=0
+    fr_anime "${1#fr:}" vo | sed -n 's|^S||p' | while IFS= read -r _title; do
+        printf "%s/%s\t%s\n" "$1" "$_i" "$_title"
+        _i=$((_i + 1))
+    done
+}
+
+# format is (ep_no \t comma separated players), only the episodes available in the language $2 are kept
+fr_episodes() {
+    _id="${1#fr:}"
+    _season="${_id#*/}"
+    _s=-1
+    _e=0
+    _lang="$(fr_lang "$2")"
+    fr_anime "${_id%/*}" "$_lang" | while IFS= read -r _line; do
+        case "$_line" in
+            S*)
+                _s=$((_s + 1))
+                _e=0
+                ;;
+            E*)
+                _e=$((_e + 1))
+                [ "$_s" = "$_season" ] && [ -n "${_line#E}" ] && printf "%s\t%s\n" "$_e" "${_line#E}"
+                ;;
+            *) ;;
+        esac
+    done
+}
+
+# asks the api for player $2 of episode $1, the encoded embed url is usually in b but every parameter is tried
+fr_player_url() {
+    _id="${anime_id#fr:}"
+    _path="anime/${_id%/*}/${_id#*/}/$(($1 - 1))/$(fr_lang "$mode")/$2"
+    _answer="$(fr_curl "$_path")" || return 1
+    # a bare "https://franime.fr" answer happens when the api is busy, it is worth a second try
+    case "$_answer" in
+        *\?*) ;;
+        *) sleep 2 && _answer="$(fr_curl "$_path")" || return 1 ;;
+    esac
+    case "$_answer" in
+        *\?*) ;;
+        *) return 1 ;;
+    esac
+    _params="$(printf "%s" "${_answer#*\?}" | tr '&' '\n' | sed 's|%3D|=|g; s|%2B|+|g; s|%2F|/|g')"
+    for _param in $(printf "%s\n" "$_params" | grep '^b=') $(printf "%s\n" "$_params" | grep -v '^b='); do
+        _url="$(fr_decode "${_param#*=}")" || continue
+        case "$_url" in
+            http*://[a-zA-Z0-9]*) printf "%s" "$_url" && return 0 ;;
+            *) ;;
+        esac
+    done
+    return 1
+}
+
+search_anime() {
+    case "$provider" in
+        all | animesama) as_search "$1" || warn "anime-sama ne répond pas ($as_base)" ;;
+        *) ;;
+    esac
+    case "$provider" in
+        all | franime) fr_search "$1" || warn "franime ne répond pas" ;;
+        *) ;;
+    esac
+}
+
+# details shown next to the search results and the seasons, $1 is their id
+preview_anime() {
+    _id="${1%%/*}"
+    case "$_id" in
+        as:*) as_preview "${_id#as:}" ;;
+        fr:*) fr_preview "${_id#fr:}" ;;
+        *) ;;
+    esac
+}
+
+seasons() {
+    case "$1" in
+        as:*) as_seasons "$1" ;;
+        fr:*) fr_seasons "$1" ;;
+        *) return 1 ;;
+    esac
+}
+
+# versions of a season as (code \t label)
+languages() {
+    case "$1" in
+        as:*) as_languages "$1" ;;
+        fr:*) printf "vostfr\tVOSTFR\nvf\tVF\n" ;;
+        *) return 1 ;;
+    esac
+}
+
+# $1 = season id, $2 = language code
+episodes() {
+    case "$1" in
+        as:*) as_episodes "$1" "$2" ;;
+        fr:*) fr_episodes "$1" "$2" ;;
+        *) return 1 ;;
+    esac
+}
+
+# one line of list_players, the host chosen last in the player menu goes before the others
+player_line() {
+    [ "$_rank" -gt 0 ] || return 0
+    _key="$(printf "%s" "${2%%.*}" | tr '[:upper:]' '[:lower:]')"
+    [ -n "$preferred_player" ] && [ "$_key" = "$preferred_player" ] && _rank=0
+    printf "%s\t%s\t%s\n" "$_rank" "$1" "$2"
+}
+
+# supported players of episode $1, best ranked first. format is (value \t host), the value is an
+# embed url on anime-sama and the index of the player on franime
+list_players() {
+    _data="$(printf "%s\n" "$episode_maps" | sed -n "s|^${1}	||p" | head -n 1)"
+    [ -z "$_data" ] && return 1
+    set -f
+    case "$anime_id" in
+        as:*)
+            for _embed in $_data; do
+                host_rank "$_embed"
+                _host_name="$(printf "%s" "$_embed" | sed -E 's|^https?://||; s|[/?].*||; s/^(www|video|embed|player)\.//')"
+                player_line "$_embed" "$_host_name"
+            done
+            ;;
+        fr:*)
+            printf "%s\n" "$_data" | tr ',' '\n' | {
+                _i=0
+                while IFS= read -r _host_name; do
+                    host_rank "$_host_name"
+                    player_line "$_i" "$_host_name"
+                    _i=$((_i + 1))
+                done
+            }
+            ;;
+        *) ;;
+    esac | sort -n -s | cut -f 2,3
+    set +f
+}
+
+# asks player $2 of episode $1 for links
+try_player() {
+    case "$anime_id" in
+        as:*)
+            site_referer="$as_base/"
+            extract_embed "$2"
+            ;;
+        fr:*)
+            site_referer="https://franime.fr/"
+            _embed="$(fr_player_url "$1" "$2")" && extract_embed "$_embed"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# tries the players of episode $1 until one gives links, $forced_player (set by the player menu) is tried alone
+get_links() {
+    _players="$(list_players "$1")"
+    if [ -n "$forced_player" ]; then
+        _players="$(printf "%s\n" "$_players" | while IFS="	" read -r _value _host_name; do
+            [ "$_value" = "$forced_player" ] && printf "%s\t%s\n" "$_value" "$_host_name"
+        done)"
+        forced_player=""
+    fi
+    [ -z "$_players" ] && return 1
+    while IFS="	" read -r _value _host_name; do
+        status "Épisode $1 : essai du lecteur $_host_name…"
+        try_player "$1" "$_value" && current_player="$_value" && return 0
+    done <<EOF
+$_players
+EOF
+    return 1
+}
+
+# the mal id is needed by ani-skip
+get_mal_id() {
+    _id="${anime_id#*:}"
+    case "$anime_id" in
+        as:*) mal_id="$(as_page "${_id%%/*}" | sed -nE 's|.*myanimelist\.net/anime/([0-9]+).*|\1|p' | head -n 1)" ;;
+        fr:*) mal_id="$(fetch "https://kitsu.app/api/edge/anime/${_id%%/*}/mappings" | tr '}' '\n' | sed -nE 's|.*"externalSite":"myanimelist/anime","externalId":"([0-9]+)".*|\1|p' | head -n 1)" ;;
+        *) ;;
+    esac
 }
 
 # select the quality according to the setting
@@ -248,22 +899,34 @@ select_quality() {
         worst) _result=$(printf "%s" "$links" | grep -E '^[0-9]{3,4}' | tail -n 1) ;;
         *) _result=$(printf "%s" "$links" | grep -m 1 "$1") ;;
     esac
-    [ -z "$_result" ] && printf "\33[2K\r\033[1;33m%s\033[0m\n" "$1 not found, defaulting to best" >&2 && _result=$(printf "%s" "$links" | head -n 1)
+    [ -z "$_result" ] && warn "$1 introuvable, qualité maximale utilisée" && _result=$(printf "%s" "$links" | head -n 1)
 
     video_link=$(printf "%s" "$_result" | cut -d ">" -f 2)
+    current_quality="${_result%% >*}"
 }
 
-# gets embed url, collects direct links and selects one with desired quality into $episode
+# collects direct links from the players of the episode and selects one with desired quality into $video_link
 get_video_link() {
-    hianime_m3u8 "$ep_no" "$mode" || die "No sources found for $mode!"
-    info "hianime.at links fetched"
+    _lang="$(lang_label "$mode")"
+    status "Recherche d'une source pour l'épisode $ep_no en $_lang…"
+    get_links "$ep_no" || {
+        warn "Aucune source lisible trouvée pour l'épisode $ep_no en $_lang"
+        return 1
+    }
     select_quality "$quality"
-    # should never trigger but just in case
-    if printf "%s" "$ep_list" | grep -q "^$ep_no$"; then
-        [ -z "$video_link" ] && die "Episode is released, but no valid sources!"
-    else
-        [ -z "$video_link" ] && die "Episode not released!"
+    [ -n "$video_link" ] || {
+        warn "L'épisode est sorti, mais aucune source valide !"
+        return 1
+    }
+    _host="${refr#*://}"
+    _host="${_host%%/*}"
+    current_host="$_host"
+    if [ "$tui" = 1 ]; then
+        status "▶ $anime_title  ·  Épisode $ep_no  ·  $_lang  ·  $current_quality  ·  $_host"
+        return 0
     fi
+    printf "\33[2K\r\033[1;35m▶\033[0m \033[1m%s\033[0m  \033[2m·\033[0m Épisode %s  \033[2m·\033[0m %s  \033[2m·\033[0m %s  \033[2m(%s)\033[0m\n" \
+        "$anime_title" "$ep_no" "$_lang" "$current_quality" "$_host"
 }
 
 # provide countdown for the next episode release both sub and dub
@@ -288,7 +951,7 @@ time_until_next_ep() {
 
         printf "Eng: %s\n" "$_eng_title"
         printf "Jpn: %s\n" "$_jpn_title"
-        printf "Status: \033[1;%sm%s\033[0m\n" "$_color" "$_status"
+        printf "Statut : \033[1;%sm%s\033[0m\n" "$_color" "$_status"
 
         if [ "$_status" != "Finished" ]; then
             _page="$($curl_exe -s "$animeschedule/anime/$_route")"
@@ -298,9 +961,9 @@ time_until_next_ep() {
             _dub_countdown=$(printf "%s" "$_page" | sed -nE 's|.*class="countdown-time countdown-time-dub" datetime="([^"]*)".*|\1|p' | head -n 1)
 
             [ -n "$_sub_ep" ] && [ -n "$_sub_countdown" ] &&
-                printf "Next Sub: Episode %s in \033[1;%sm%s\033[0m\n" "$_sub_ep" "$_color" "$_sub_countdown" || printf "Next Sub: N/A\n"
+                printf "Prochain épisode (VO) : %s dans \033[1;%sm%s\033[0m\n" "$_sub_ep" "$_color" "$_sub_countdown" || printf "Prochain épisode (VO) : N/A\n"
             [ -n "$_dub_ep" ] && [ -n "$_dub_countdown" ] &&
-                printf "Next Dub: Episode %s in \033[1;%sm%s\033[0m\n" "$_dub_ep" "$_color" "$_dub_countdown" || printf "Next Dub: N/A\n"
+                printf "Prochain épisode (doublé) : %s dans \033[1;%sm%s\033[0m\n" "$_dub_ep" "$_color" "$_dub_countdown" || printf "Prochain épisode (doublé) : N/A\n"
         fi
         printf "\n"
     done
@@ -309,34 +972,408 @@ time_until_next_ep() {
 
 # HISTORY
 
+# entries from the english providers can't be resolved anymore, they are moved to a backup file
 backup_old_hist() {
-    backupfile="${histfile}.v4"
+    backupfile="${histfile}.old"
     : >"${histfile}.new"
     while IFS="	" read -r ep_no anime_id anime_title; do
         case "$anime_id" in
-            *-*) printf "%s\t%s\t%s\n" "$ep_no" "$anime_id" "$anime_title" >>"${histfile}.new" ;;
+            as:* | fr:*) printf "%s\t%s\t%s\n" "$ep_no" "$anime_id" "$anime_title" >>"${histfile}.new" ;;
             *) printf "%s\t%s\t%s\n" "$ep_no" "$anime_id" "$anime_title" >>"$backupfile" ;;
         esac
     done <"$histfile"
     mv "${histfile}.new" "$histfile"
 }
 
-process_hist_entry() {
-    ep_list=$(hianime_episodes "$anime_id" | cut -f 2)
-    ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{n;p;}") 2>/dev/null
-    [ -n "$ep_no" ] && printf "%s\t%s - episode %s\n" "$anime_id" "$anime_title" "$ep_no"
+# history ids are (season id @ language code), the entries written before the language was kept are vostfr
+hist_split() {
+    hist_anime="${1%@*}"
+    case "$1" in
+        *@*) hist_lang="${1##*@}" ;;
+        *) hist_lang="vostfr" ;;
+    esac
 }
 
+# prints (history id \t label \t next episode \t title) when an episode is left to watch
+process_hist_entry() {
+    hist_split "$anime_id"
+    _list="$(episodes "$hist_anime" "$hist_lang" | cut -f 1)"
+    _next="$(printf "%s\n" "$_list" | sed -n "/^${ep_no}$/{n;p;}")" 2>/dev/null
+    _last="$(printf "%s\n" "$_list" | tail -n 1)"
+    _label="$(lang_label "$hist_lang")"
+    [ -n "$_next" ] && printf "%s@%s\t%s  ${c_dim}·  %s  ·  épisode %s sur %s${c_reset}\t%s\t%s\n" \
+        "$hist_anime" "$hist_lang" "$anime_title" "$_label" "$_next" "$_last" "$_next" "$anime_title"
+}
+
+# last episode watched of the current season in the current language
+hist_last_ep() {
+    while IFS="	" read -r _ep _id _title; do
+        hist_split "$_id"
+        [ "$hist_anime" = "$anime_id" ] && [ "$hist_lang" = "$mode" ] && printf "%s\n" "$_ep" && return 0
+    done <"$histfile"
+}
+
+# the entry played last goes to the end, so the most recent ones come last
 update_history() {
-    if grep -q "	${anime_id}	" "$histfile"; then
-        # escape sed special chars in replacement: & and \ and delimiter |
-        safe_title=$(printf "%s" "$anime_title" | sed 's|[&\|]|\\&|g')
-        sed -E "s|^[^	]+	${anime_id}	[^	]+$|${ep_no}	${anime_id}	${safe_title}|" "$histfile" >"${histfile}.new"
-    else
-        cp "$histfile" "${histfile}.new"
-        printf "%s\t%s\t%s\n" "$ep_no" "$anime_id" "$anime_title" >>"${histfile}.new"
-    fi
+    while IFS="	" read -r _ep _id _title; do
+        hist_split "$_id"
+        [ "$hist_anime" = "$anime_id" ] && [ "$hist_lang" = "$mode" ] && continue
+        printf "%s\t%s\t%s\n" "$_ep" "$_id" "$_title"
+    done <"$histfile" >"${histfile}.new"
+    printf "%s\t%s@%s\t%s\n" "$ep_no" "$anime_id" "$mode" "$anime_title" >>"${histfile}.new"
     mv "${histfile}.new" "$histfile"
+}
+
+# LANGUAGES
+
+# versions of the current season are kept as (code \t label) in lang_list, their episodes in maps_<code>.
+# codes are vostfr, vf and on anime-sama vf1, vf2… for the other dubs (Netflix, Crunchyroll, ADN…)
+valid_language() {
+    case "$1" in
+        vostfr | vf | vf[0-9] | vf[0-9][0-9]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+lang_maps() {
+    valid_language "$1" || return 1
+    eval "printf '%s' \"\${maps_$1-}\""
+}
+
+# finds the versions of the season and their episodes once, the empty ones are dropped
+load_languages() {
+    [ "$langs_of" = "$anime_id" ] && return 0
+    status "Recherche des langues disponibles…"
+    for _code in $lang_codes; do
+        eval "maps_$_code=''"
+    done
+    _list="$(languages "$anime_id")"
+    lang_list=""
+    lang_codes=""
+    while IFS="	" read -r _code _name; do
+        valid_language "$_code" || continue
+        _maps="$(episodes "$anime_id" "$_code")"
+        [ -z "$_maps" ] && continue
+        eval "maps_$_code=\$_maps"
+        lang_list="$lang_list$_code	$_name
+"
+        lang_codes="$lang_codes $_code"
+    done <<EOF
+$_list
+EOF
+    langs_of="$anime_id"
+}
+
+lang_count() {
+    printf "%s" "$lang_list" | grep -c ''
+}
+
+has_language() {
+    load_languages
+    case " $lang_codes " in
+        *" $1 "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+use_language() {
+    has_language "$1" || return 1
+    mode="$1"
+    episode_maps="$(lang_maps "$1")"
+    ep_list="$(printf "%s\n" "$episode_maps" | cut -f 1)"
+}
+
+# the first other version of the season
+other_language() {
+    for _code in $lang_codes; do
+        [ "$_code" != "$mode" ] && printf "%s" "$_code" && return 0
+    done
+}
+
+# versions with their episode count, the current one first and marked when $2 is set
+# $1 = menu title
+language_menu() {
+    _menu="$(printf "%s" "$lang_list" | while IFS="	" read -r _code _name; do
+        _count="$(lang_maps "$_code" | grep -c '')"
+        _plural=""
+        [ "$_count" -gt 1 ] && _plural="s"
+        _mark=""
+        [ -n "$2" ] && [ "$_code" = "$mode" ] && _mark="  ${c_seen}● en cours${c_reset}"
+        printf "%s\t%s  ${c_dim}·  %s épisode%s${c_reset}%s\n" "$_code" "$_name" "$_count" "$_plural" "$_mark"
+    done)"
+    # a missing dub puts the other dubs first
+    _first="^$mode	"
+    [ "${mode#vf}" != "$mode" ] && ! has_language "$mode" && _first="^vf"
+    _menu="$(
+        printf "%s\n" "$_menu" | grep "$_first"
+        printf "%s\n" "$_menu" | grep -v "$_first"
+    )"
+    menu_header="$anime_title" menu_preview="" menu_start=""
+    [ -n "$2" ] && menu_start=2
+    _chosen="$(printf "%s\n" "$_menu" | choose "$1")"
+    [ -z "$_chosen" ] && return 1
+    use_language "$_chosen"
+}
+
+# the preferred language comes first. a forced one (--vf, --vostfr, ANI_CLI_MODE or -e) is only asked when it is missing,
+# returns 1 when the menu is left and 2 when the season has no episode at all
+choose_language() {
+    load_languages
+    [ -z "$lang_codes" ] && warn "Aucun épisode disponible pour $anime_title" && return 2
+    if [ "$lang_forced" = 1 ]; then
+        use_language "$mode" && return 0
+        # a dub (--vf, or VF Netflix kept from the other site) takes the only dub of this one
+        _dubs="$(printf "%s" "$lang_list" | grep '^vf' | cut -f 1)"
+        _dub_count="$(printf "%s\n" "$_dubs" | grep -c '')"
+        [ "${mode#vf}" != "$mode" ] && [ -n "$_dubs" ] && [ "$_dub_count" -eq 1 ] && use_language "$_dubs" && return 0
+        _label="$(lang_label "$mode")"
+        if [ "${mode#vf}" != "$mode" ] && [ "$_dub_count" -gt 1 ]; then
+            note "Plusieurs VF disponibles pour $anime_title"
+        else
+            warn "$anime_title n'existe pas en $_label"
+        fi
+    fi
+    _versions="$(lang_count)"
+    if [ "$_versions" -eq 1 ]; then
+        _label="$(lang_label "${lang_codes# }")"
+        note "Disponible uniquement en $_label"
+    fi
+    language_menu "Choisir la langue"
+}
+
+# the episodes up to the last one watched are ticked and the cursor starts on the next one
+choose_episode() {
+    _seen="$(hist_last_ep)"
+    _seen_line=""
+    [ -n "$_seen" ] && _seen_line="$(printf "%s\n" "$ep_list" | grep -n -x -F -- "$_seen" | head -n 1 | cut -d : -f 1)"
+    _count="$(printf "%s\n" "$ep_list" | grep -c '')"
+    menu_start=""
+    [ -n "$_seen_line" ] && [ "$_seen_line" -lt "$_count" ] && menu_start=$((_seen_line + 1))
+    menu_header="$anime_title  ·  $(lang_label "$mode")  ·  $_count épisodes  ·  Tab : en choisir plusieurs"
+    menu_preview=""
+    printf "%s\n" "$ep_list" | sed 's|.*|&	Épisode &|' | if [ -n "$_seen_line" ]; then
+        sed "1,${_seen_line}s|\$|  ${c_seen}✓ vu${c_reset}|"
+    else
+        cat
+    fi | choose "Choisir l'épisode" "$menu_multi_flag"
+}
+
+# players of the episode, the one in use is marked. prints the chosen value
+choose_player() {
+    _players="$(list_players "$ep_no")"
+    if [ -z "$_players" ]; then
+        warn "Aucun lecteur pris en charge pour l'épisode $ep_no"
+        return 1
+    fi
+    menu_header="$anime_title  ·  Épisode $ep_no  ·  $(lang_label "$mode")" menu_preview="" menu_start=""
+    printf "%s\n" "$_players" | {
+        _n=0
+        while IFS="	" read -r _value _host_name; do
+            _n=$((_n + 1))
+            _mark=""
+            [ "$play_failed" = 0 ] && [ "$_value" = "$current_player" ] && _mark="  ${c_seen}● en cours${c_reset}"
+            printf "%s\tLecteur %s  ${c_dim}·${c_reset}  %s%s\n" "$_value" "$_n" "$_host_name" "$_mark"
+        done
+    } | choose "Choisir un lecteur"
+}
+
+# SITES
+
+site_label() {
+    case "$1" in
+        fr:* | franime) printf "franime" ;;
+        *) printf "anime-sama" ;;
+    esac
+}
+
+# the provider the current anime is not on
+other_site() {
+    case "$anime_id" in
+        fr:*) printf "animesama" ;;
+        *) printf "franime" ;;
+    esac
+}
+
+# $1 = prompt, sets query (with +) and user_query
+ask_query() {
+    query=""
+    if [ "$tui" = 1 ]; then
+        ui_reset "$1"
+        ui_ask=1 ui_input=1 ui_ghost="tapez puis Entrée" ui_empty="Entrée pour chercher, Échap pour annuler"
+        ui_header="$(tui_take_notice)"
+        query="$(: | ui_menu)"
+        case "$query" in
+            @home) kill -USR2 "$$" && return 1 ;;
+            @quit) kill -USR1 "$$" && return 1 ;;
+            *) ;;
+        esac
+        [ -z "$query" ] && return 1
+    elif [ "$menu_program" = "fzf" ]; then
+        while [ -z "$query" ]; do
+            printf "\33[2K\r\033[1;35m❯\033[0m \033[1m%s :\033[0m " "$1" >&2
+            read -r query || return 1
+        done
+    else
+        query="$(: | menu "$1" "" "$menu_extra_flags")"
+        [ -z "$query" ] && return 1
+    fi
+    user_query="$(printf "%s" "$query" | tr '+' ' ')"
+    query="$(printf "%s" "$query" | sed 's| |+|g')"
+}
+
+# the anime menu over anime_list, each result shows its site. $1 = header
+pick_anime() {
+    if [ "$index" -eq "$index" ] 2>/dev/null; then
+        anime_id="$(printf "%s\n" "$anime_list" | sed -n "${index}p" | cut -f 1)"
+        index=""
+    else
+        menu_header="$1" menu_preview="$menu_preview_cmd" menu_start=""
+        anime_id="$(printf "%s\n" "$anime_list" | sed -e "s|^\(as:[^	]*	.*\)|\1  ${c_dim}·${c_reset} ${c_as}anime-sama${c_reset}|" \
+            -e "s|^\(fr:[^	]*	.*\)|\1  ${c_dim}·${c_reset} ${c_fr}franime${c_reset}|" | choose "Choisir un anime")"
+    fi
+    [ -z "$anime_id" ] && return 1
+    anime_title="$(label_of "$anime_list" "$anime_id")"
+    [ -n "$anime_title" ]
+}
+
+# season then language of the chosen anime, returns 1 when a menu is left and 2 when nothing is found
+pick_season() {
+    base_title="$anime_title"
+    status "Chargement des saisons de $anime_title…"
+    case "$anime_id" in
+        fr:*) fr_cache_anime "${anime_id#fr:}" ;;
+        *) ;;
+    esac
+    season_list="$(seasons "$anime_id")"
+    if [ -z "$season_list" ]; then
+        _site="$(site_label "$anime_id")"
+        warn "Aucune saison trouvée pour $anime_title sur $_site"
+        return 2
+    fi
+    menu_header="$anime_title" menu_preview="$menu_preview_cmd" menu_start=""
+    _season="$(printf "%s\n" "$season_list" | choose "Choisir la saison")"
+    [ -z "$_season" ] && return 1
+    anime_id="$_season"
+    anime_title="$anime_title - $(label_of "$season_list" "$_season")"
+    choose_language
+}
+
+result_count() {
+    _count="$(printf "%s\n" "$anime_list" | grep -c '')"
+    _plural=""
+    [ "$_count" -gt 1 ] && _plural="s"
+    printf "%s résultat%s" "$_count" "$_plural"
+}
+
+save_state() {
+    saved_state="$anime_id	$anime_title	$base_title	$mode	$ep_no"
+    saved_anime_list="$anime_list"
+}
+
+restore_state() {
+    IFS="	" read -r anime_id anime_title base_title mode ep_no <<EOF
+$saved_state
+EOF
+    anime_list="$saved_anime_list"
+    langs_of=""
+    # the episode maps only matter once something played
+    [ "$playing" = 1 ] && use_language "$mode"
+}
+
+# looks for the current anime on the other site and moves there, the language and the episode are kept when they exist
+find_on_other_site() {
+    _provider="$(other_site)"
+    _site="$(site_label "$_provider")"
+    save_state
+    _found=""
+    for _q in "$base_title" "${base_title%%:*}" "$user_query"; do
+        [ -z "$_q" ] && continue
+        status "Recherche de « $_q » sur $_site…"
+        _found="$(
+            provider="$_provider"
+            _q="$(printf "%s" "$_q" | sed 's| |+|g')"
+            search_anime "$_q"
+        )"
+        [ -n "$_found" ] && break
+    done
+    if [ -z "$_found" ]; then
+        warn "« $base_title » introuvable sur $_site"
+        ask_query "Rechercher sur $_site" || return 1
+        _found="$(
+            provider="$_provider"
+            search_anime "$query"
+        )"
+        [ -z "$_found" ] && warn "Aucun résultat pour « $user_query » sur $_site" && return 1
+    fi
+    anime_list="$_found"
+    _saved_forced="$lang_forced"
+    while :; do
+        _header="$(result_count) sur $_site"
+        if ! pick_anime "$_header"; then
+            restore_state
+            return 1
+        fi
+        # the language in use is kept when the other site has it
+        lang_forced=1
+        pick_season
+        _status=$?
+        lang_forced="$_saved_forced"
+        [ "$_status" = 0 ] && break
+        _count="$(printf "%s\n" "$anime_list" | grep -c '')"
+        [ "$_status" = 1 ] && [ "$_count" -gt 1 ] && continue
+        restore_state
+        return 1
+    done
+    printf "%s\n" "$ep_list" | grep -q -x -F -- "$ep_no" && return 0
+    _choice="$(choose_episode)"
+    if [ -z "$_choice" ]; then
+        restore_state
+        return 1
+    fi
+    ep_no="$_choice"
+}
+
+# what to do while an episode plays or after it failed, $has_other tells if another version exists
+playback_menu() {
+    _first="$(printf "%s\n" "$ep_list" | head -n 1)"
+    _last="$(printf "%s\n" "$ep_list" | tail -n 1)"
+    _lang="$(lang_label "$mode")"
+    _site="$(other_site)"
+    _site="$(site_label "$_site")"
+    _versions="$(lang_count)"
+    _other="$(other_language)"
+    _other="$(lang_label "$_other")"
+    _qualities="$(printf "%s\n" "$links" | grep -c '>')"
+    _players="$(list_players "$ep_no" | grep -c '')"
+    menu_preview="" menu_start=""
+    if [ "$play_failed" = 1 ]; then
+        menu_header="✕ Aucune source lisible pour l'épisode $ep_no  ·  $anime_title  ·  $_lang"
+        {
+            [ "$_players" -gt 0 ] && printf "lecteur\t⇆  Essayer un autre lecteur\n"
+            printf "site\t⌕  Chercher sur %s\n" "$_site"
+            [ "$_versions" -eq 2 ] && printf "langue\t⇄  Essayer en %s\n" "$_other"
+            [ "$_versions" -gt 2 ] && printf "langue\t⇄  Essayer une autre version (%s disponibles)\n" "$_versions"
+            printf "choisir\t≡  Choisir un autre épisode\n"
+            [ "$ep_no" != "$_last" ] && printf "suivant\t›  Passer à l'épisode suivant\n"
+            [ "$tui" = 1 ] && printf "accueil\t⌂  Retour à l'accueil\n"
+            printf "quitter\t✕  Quitter\n"
+        } | choose "Que faire ?"
+        return 0
+    fi
+    menu_header="▶ $anime_title  ·  Épisode $ep_no sur $_last  ·  $_lang${current_quality:+  ·  $current_quality}${current_host:+  ·  $current_host}"
+    {
+        [ "$ep_no" != "$_last" ] && printf "suivant\t›  Épisode suivant\n"
+        printf "rejouer\t↻  Rejouer\n"
+        [ "$ep_no" != "$_first" ] && printf "précédent\t‹  Épisode précédent\n"
+        printf "choisir\t≡  Choisir un épisode\n"
+        [ "$_versions" -eq 2 ] && printf "langue\t⇄  Passer en %s\n" "$_other"
+        [ "$_versions" -gt 2 ] && printf "langue\t⇄  Changer de version (%s disponibles)\n" "$_versions"
+        [ "$_players" -gt 1 ] && printf "lecteur\t⇆  Changer de lecteur (%s disponibles)\n" "$_players"
+        [ "$_qualities" -gt 1 ] && printf "qualité\t◐  Changer la qualité\n"
+        printf "site\t⌕  Regarder sur %s\n" "$_site"
+        [ "$tui" = 1 ] && printf "accueil\t⌂  Retour à l'accueil\n"
+        printf "quitter\t✕  Quitter\n"
+    } | choose "Que faire ?"
 }
 
 # PLAYING
@@ -358,26 +1395,33 @@ android_mpv() {
         [ -d "$_conf_dir" ] || mkdir "$_conf_dir"
         printf "referrer=%s\n%s\n" "$refr" "${sub_link:+sub-file=$sub_link}" >"$_conf_dir/mpv.config.mp4"
     fi
-    nohup am start --user 0 -a android.intent.action.VIEW -d "$video_link" -n is.xyz.mpv/.MPVActivity -e "title" "${anime_title} Episode ${ep_no}" $player_extra_flags >/dev/null 2>&1 &
+    nohup am start --user 0 -a android.intent.action.VIEW -d "$video_link" -n is.xyz.mpv/.MPVActivity -e "title" "${anime_title} Épisode ${ep_no}" $player_extra_flags >/dev/null 2>&1 &
 }
 
 play_episode() {
     [ "$log_episode" = 1 ] && [ "$player_function" != "debug" ] && [ "$player_function" != "download" ] && command -v logger >/dev/null && logger -t ani-cli "${anime_title} ${ep_no}"
-    [ -z "$video_link" ] && get_video_link
-    [ "$skip_intro" = 1 ] && skip_flag="$(ani-skip -i "$mal_id" -e "$ep_no")"
+    [ -n "$video_link" ] || get_video_link || return 1
+    if [ "$skip_intro" = 1 ]; then
+        [ -z "$mal_id" ] && get_mal_id
+        if [ -n "$mal_id" ]; then
+            skip_flag="$(ani-skip -i "$mal_id" -e "$ep_no")"
+        else
+            warn "Identifiant MyAnimeList introuvable, ani-skip désactivé"
+        fi
+    fi
     # wait for the previous player to close (in range selection)
     wait
     # shellcheck disable=SC2086
     case "$player_function" in
-        debug) printf "All links:\n%s\nSelected link:\n%s\nSubtitles:\n%s\n" "$links" "$video_link" "$sub_link" ;;
+        debug) printf "Tous les liens :\n%s\nLien choisi :\n%s\nReferer :\n%s\n" "$links" "$video_link" "$refr" ;;
         android_mpv) android_mpv ;;
-        android_vlc) nohup am start --user 0 -a android.intent.action.VIEW -d "$video_link" -n org.videolan.vlc/org.videolan.vlc.gui.video.VideoPlayerActivity -e "title" "${anime_title} Episode ${ep_no}" $player_extra_flags >/dev/null 2>&1 & ;;
-        *flatpak*mpv*) flatpak run io.mpv.Mpv --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} $skip_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 & ;;
+        android_vlc) nohup am start --user 0 -a android.intent.action.VIEW -d "$video_link" -n org.videolan.vlc/org.videolan.vlc.gui.video.VideoPlayerActivity -e "title" "${anime_title} Épisode ${ep_no}" $player_extra_flags >/dev/null 2>&1 & ;;
+        *flatpak*mpv*) flatpak run io.mpv.Mpv --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} $skip_flag $player_extra_flags --force-media-title="${anime_title} Épisode ${ep_no}" "$video_link" >/dev/null 2>&1 & ;;
         *mpv*)
             if [ "$no_detach" = 0 ]; then
-                nohup $player_function --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} $skip_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 &
+                nohup $player_function --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} $skip_flag $player_extra_flags --force-media-title="${anime_title} Épisode ${ep_no}" "$video_link" >/dev/null 2>&1 &
             else
-                $player_function --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} $skip_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link"
+                $player_function --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} $skip_flag $player_extra_flags --force-media-title="${anime_title} Épisode ${ep_no}" "$video_link"
                 mpv_exitcode=$?
                 [ "$exit_after_play" = 1 ] && [ -z "$_range" ] && exit "$mpv_exitcode"
             fi
@@ -387,17 +1431,17 @@ play_episode() {
             _sub_iina="$(printf "%s" "$sub_link" | sed 's|:|\\:|g')"
             if pgrep -f "IINA" >/dev/null 2>&1; then
                 # omit --keep-running when an IINA instance exists to prevent hanging
-                nohup $player_function --mpv-referrer="$refr" ${_sub_iina:+--mpv-sub-files="$_sub_iina"} $player_extra_flags --no-stdin --mpv-force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 &
+                nohup $player_function --mpv-referrer="$refr" ${_sub_iina:+--mpv-sub-files="$_sub_iina"} $player_extra_flags --no-stdin --mpv-force-media-title="${anime_title} Épisode ${ep_no}" "$video_link" >/dev/null 2>&1 &
             else
-                nohup $player_function --mpv-referrer="$refr" ${_sub_iina:+--mpv-sub-files="$_sub_iina"} $player_extra_flags --no-stdin --keep-running --mpv-force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 &
+                nohup $player_function --mpv-referrer="$refr" ${_sub_iina:+--mpv-sub-files="$_sub_iina"} $player_extra_flags --no-stdin --keep-running --mpv-force-media-title="${anime_title} Épisode ${ep_no}" "$video_link" >/dev/null 2>&1 &
             fi
             ;;
-        *vlc*) nohup $player_function --http-referrer="$refr" $player_extra_flags --play-and-exit --meta-title="${anime_title} Episode ${ep_no}" "$video_link" ${sub_link:+:input-slave="$sub_link"} >/dev/null 2>&1 & ;;
-        *yncpla*) nohup $player_function $player_extra_flags "$video_link" -- $skip_flag --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} --force-media-title="${anime_title} Episode ${ep_no}" >/dev/null 2>&1 & ;;
-        download) "$player_function" "$video_link" "${anime_title} Episode ${ep_no}" $player_extra_flags ;;
+        *vlc*) nohup $player_function --http-referrer="$refr" $player_extra_flags --play-and-exit --meta-title="${anime_title} Épisode ${ep_no}" "$video_link" ${sub_link:+:input-slave="$sub_link"} >/dev/null 2>&1 & ;;
+        *yncpla*) nohup $player_function $player_extra_flags "$video_link" -- $skip_flag --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} --force-media-title="${anime_title} Épisode ${ep_no}" >/dev/null 2>&1 & ;;
+        download) "$player_function" "$video_link" "${anime_title} Épisode ${ep_no}" $player_extra_flags ;;
         catt) nohup catt cast $player_extra_flags "$video_link" >/dev/null 2>&1 & ;;
         iSH)
-            printf "\033]8;;vlc://%s\a~~~~~~~~~~~~~~~~~~~~\n~ Tap to open VLC ~\n~~~~~~~~~~~~~~~~~~~~\033]8;;\a\n" "$video_link"
+            printf "\033]8;;vlc://%s\a~~~~~~~~~~~~~~~~~~~~~~~~~~\n~ Touchez pour ouvrir VLC ~\n~~~~~~~~~~~~~~~~~~~~~~~~~~\033]8;;\a\n" "$video_link"
             sleep 5
             ;;
         *) nohup $player_function $player_extra_flags "$video_link" >/dev/null 2>&1 & ;;
@@ -406,9 +1450,11 @@ play_episode() {
     unset video_link
     update_history
     [ "$menu_program" != "fzf" ] && wait
+    return 0
 }
 
 play() {
+    _failed=0
     _start=$(printf "%s" "$ep_no" | grep -Eo '^(-1|[0-9]+(\.[0-9]+)?)')
     _end=$(printf "%s" "$ep_no" | grep -Eo '(-1|[0-9]+(\.[0-9]+)?)$')
     [ "$_start" = "-1" ] && ep_no=$(printf "%s" "$ep_list" | tail -n 1) && unset _start
@@ -420,53 +1466,1641 @@ play() {
         [ -z "$_start" ] && _start=$(printf "%s\n" "$ep_no" | head -n 1)
         [ -z "$_end" ] && _end=$(printf "%s\n" "$ep_no" | tail -n 1)
         _range=$(printf "%s\n" "$ep_list" | sed -nE "/^${_start}\$/,/^${_end}\$/p")
-        [ -z "$_range" ] && die "Invalid range!"
+        [ -z "$_range" ] && die "Plage invalide !"
         for i in $_range; do
             tput clear
             ep_no=$i
-            info "Playing episode $ep_no..."
             [ "$i" = "$_end" ] && unset _range
-            play_episode
+            play_episode || _failed=1
         done
     else
-        printf "%s" "$ep_list" | grep -q "^$ep_no$" || die "Invalid episode!"
-        play_episode
+        printf "%s" "$ep_list" | grep -q "^$ep_no$" || die "Épisode invalide !"
+        play_episode || _failed=1
     fi
-    # moves up to stored position and deletes to end
-    [ "$player_function" != "debug" ] && [ "$player_function" != "download" ] && tput rc && tput ed
+    # moves up to stored position and deletes to end, a failure stays on screen above the menu
+    [ "$_failed" = 1 ] && return 1
+    [ "$tui" != 1 ] && [ "$player_function" != "debug" ] && [ "$player_function" != "download" ] && tput rc && tput ed
+    return 0
+}
+
+# FULL SCREEN INTERFACE
+
+# the script draws this interface itself: the line under the mouse is highlighted and previewed,
+# a click chooses, the wheel scrolls, buttons light up under the pointer and loading is animated.
+# everything is drawn on fd 3 (the terminal), menus print the chosen lines on stdout like the classic ones
+set_colors() {
+    c_as="$(printf '\033[35m')"
+    c_fr="$(printf '\033[36m')"
+    c_dim="$(printf '\033[2m')"
+    c_seen="$(printf '\033[32m')"
+    c_bold="$(printf '\033[1;35m')"
+    c_reset="$(printf '\033[0m')"
+}
+
+tui_vars() {
+    self="$0"
+    export ANI_CLI_SELF="$self"
+    ui_e="$(printf '\033')"
+    ui_cr="$(printf '\r')"
+    ui_tab="$(printf '\t')"
+    ui_ctrl="$(printf '\001-\037\177')"
+    ui_cont="$(printf '\200-\277')"
+    ui_cut="$(printf '\001')"
+    ui_anim="${ANI_CLI_ANIMATIONS:-1}"
+    ui_del="$(printf '\177')"
+    ui_bs="$(printf '\010')"
+    ui_ctrl_d="$(printf '\004')"
+    ui_ctrl_n="$(printf '\016')"
+    ui_ctrl_p="$(printf '\020')"
+    ui_ctrl_q="$(printf '\021')"
+    ui_ctrl_s="$(printf '\023')"
+    ui_ctrl_u="$(printf '\025')"
+    ui_accent=207
+    ui_accent2=171
+    ui_button=99
+    ui_bar_bg=235
+    ui_sel_bg=237
+    ui_border=240
+    ui_logo_1="┏━┓|┏┓╻|╻|   |┏━╸|╻  |╻|   |┏━╸|┏━┓"
+    ui_logo_2="┣━┫|┃┗┫|┃|╺━╸|┃  |┃  |┃|╺━╸|┣╸ |┣┳┛"
+    ui_logo_3="╹ ╹|╹ ╹|╹|   |┗━╸|┗━╸|╹|   |╹  |╹┗╸"
+}
+
+# $1 = provider
+tui_init() {
+    tui_vars
+    tui_dir="$(mktemp -d "${TMPDIR:-/tmp}/ani-cli.XXXXXX")" || return 1
+    exec 3>/dev/tty || return 1
+    ui_stty="$(stty -g </dev/tty)" || return 1
+    export ANI_CLI_TUI_DIR="$tui_dir"
+    printf "%s" "$1" >"$tui_dir/provider"
+    trap 'tui_leave' EXIT
+    trap 'tui_home' USR2
+    trap 'tui_quit' USR1
+    tui_term_on
+}
+
+# alternate screen, hidden cursor, no line wrap, every mouse move reported, keys read one by one
+tui_term_on() {
+    stty -echo -icanon -icrnl -ixon min 0 time 1 </dev/tty
+    printf '\033[?1049h\033[?25l\033[?7l\033[?1000h\033[?1003h\033[?1006h' >&3
+}
+
+tui_term_off() {
+    printf '\033[?1006l\033[?1003l\033[?1000l\033[?7h\033[?25h\033[0m' >&3
+    stty "$ui_stty" </dev/tty
+}
+
+tui_leave() {
+    ui_anim_stop
+    cleanup
+    tui_term_off
+    printf '\033[?1049l' >&3
+    [ -s "$tui_dir/fatal" ] && cat "$tui_dir/fatal" >&2
+    rm -rf "$tui_dir"
+}
+
+tui_quit() {
+    [ -s "$tui_dir/fatal" ] && exit 1
+    exit 0
+}
+
+# back home is a fresh start of the script, the videos already playing keep going
+tui_home() {
+    ui_anim_stop
+    cleanup
+    tui_term_off
+    rm -rf "$tui_dir"
+    exec sh "$self"
+}
+
+tui_take_notice() {
+    [ -s "$tui_dir/notice" ] || return 0
+    sed '$!N;$!D' "$tui_dir/notice"
+    rm -f "$tui_dir/notice"
+}
+
+# DRAWING
+
+ui_size() {
+    _size="$(stty size </dev/tty 2>/dev/null)"
+    ui_rows="${_size% *}"
+    ui_cols="${_size#* }"
+    [ "$ui_rows" -gt 0 ] 2>/dev/null || ui_rows=24
+    [ "$ui_cols" -gt 0 ] 2>/dev/null || ui_cols=80
+}
+
+# columns taken by $1, accented letters count once
+ui_width() {
+    printf "%s" "$1" | LC_ALL=C tr -d '\200-\277' | wc -c | tr -d '[:space:]'
+}
+
+# $1 repeated $2 times
+ui_repeat() {
+    _result=""
+    _piece="$1"
+    _times="$2"
+    while [ "$_times" -gt 0 ]; do
+        [ $((_times % 2)) = 1 ] && _result="$_result$_piece"
+        _piece="$_piece$_piece"
+        _times=$((_times / 2))
+    done
+    printf "%s" "$_result"
+}
+
+# sets ui_c to the shade number $1 of a purple to pink wave (256 colours)
+ui_color() {
+    case $(($1 % 10)) in
+        0) ui_c=93 ;;
+        1 | 9) ui_c=99 ;;
+        2 | 8) ui_c=135 ;;
+        3 | 7) ui_c=171 ;;
+        4 | 6) ui_c=207 ;;
+        *) ui_c=213 ;;
+    esac
+}
+
+ui_spinner() {
+    case $(($1 % 10)) in
+        0) ui_s="⠋" ;;
+        1) ui_s="⠙" ;;
+        2) ui_s="⠹" ;;
+        3) ui_s="⠸" ;;
+        4) ui_s="⠼" ;;
+        5) ui_s="⠴" ;;
+        6) ui_s="⠦" ;;
+        7) ui_s="⠧" ;;
+        8) ui_s="⠇" ;;
+        *) ui_s="⠏" ;;
+    esac
+}
+
+# $1 = column, $2 = row, $3 = frame. each letter takes the next shade, the frame makes them flow
+ui_logo_draw() {
+    _row="$2"
+    _old_ifs="$IFS"
+    set -f
+    for _lines in "$ui_logo_1" "$ui_logo_2" "$ui_logo_3"; do
+        printf '\033[%s;%sH\033[1m' "$_row" "$1" >&3
+        _j="$3"
+        IFS="|"
+        for _seg in $_lines; do
+            ui_color "$_j"
+            printf '\033[38;5;%sm%s' "$ui_c" "$_seg" >&3
+            _j=$((_j + 1))
+        done
+        IFS="$_old_ifs"
+        printf '\033[0m' >&3
+        _row=$((_row + 1))
+    done
+    set +f
+}
+
+# the bar on top: name of the script and of the screen
+ui_title_draw() {
+    printf '\033[1;1H\033[48;5;%sm%s\033[1;2H\033[1;38;5;%sm◆ ani-cli\033[22;38;5;141m-fr\033[39m  \033[38;5;245m›\033[39m  \033[1m%s\033[22m\033[1;%sH\033[38;5;245mv%s\033[0m' \
+        "$ui_bar_bg" "$ui_bar_blank" "$ui_accent" "$ui_title" "$((ui_cols - ${#version_number} - 2))" "$version_number" >&3
+}
+
+# rounded box, $1 = column, $2 = row, $3 = width, $4 = height
+ui_box() {
+    _line="$(ui_repeat "─" $(($3 - 2)))"
+    printf '\033[38;5;%sm\033[%s;%sH╭%s╮' "$ui_border" "$2" "$1" "$_line" >&3
+    _row=$(($2 + 1))
+    while [ "$_row" -lt $(($2 + $4 - 1)) ]; do
+        printf '\033[%s;%sH│\033[%s;%sH│' "$_row" "$1" "$_row" "$(($1 + $3 - 1))" >&3
+        _row=$((_row + 1))
+    done
+    printf '\033[%s;%sH╰%s╯\033[0m' "$(($2 + $4 - 1))" "$1" "$_line" >&3
+}
+
+# title in the top border of a box, $1 = column, $2 = row, $3 = text, $4 = spinner frame or nothing
+ui_label() {
+    # both forms take the same width, so the spinner leaves nothing behind
+    if [ -n "$4" ]; then
+        ui_spinner "$4"
+        printf '\033[%s;%sH\033[38;5;%sm─ \033[1;38;5;%sm%s\033[22;38;5;%sm %s \033[38;5;%sm─\033[0m' \
+            "$2" "$(($1 + 1))" "$ui_border" "$ui_accent" "$3" "$ui_accent2" "$ui_s" "$ui_border" >&3
+    else
+        printf '\033[%s;%sH\033[38;5;%sm─ \033[1;38;5;%sm%s\033[22;38;5;%sm ───\033[0m' \
+            "$2" "$(($1 + 1))" "$ui_border" "$ui_accent" "$3" "$ui_border" >&3
+    fi
+}
+
+# clickable spots are kept as (id row first column last column) lines
+ui_spot_add() {
+    ui_spots="$ui_spots$1 $2 $3 $4
+"
+}
+
+# button of the bars, $1 = id, $2 = hovered or not
+# shellcheck disable=SC2154
+ui_spot_draw() {
+    eval "_text=\"\${ui_spot_text_$1-}\" _row=\"\${ui_spot_row_$1-}\" _col=\"\${ui_spot_col_$1-}\" _kind=\"\${ui_spot_kind_$1-}\""
+    [ -z "$_row" ] && return 0
+    case "$_kind:$2" in
+        button:1) printf '\033[%s;%sH\033[48;5;%sm\033[1;38;5;231m %s \033[0m' "$_row" "$_col" "$ui_button" "$_text" >&3 ;;
+        button:*) printf '\033[%s;%sH\033[48;5;%sm\033[38;5;252m %s \033[0m' "$_row" "$_col" "$ui_bar_bg" "$_text" >&3 ;;
+        chip:1) printf '\033[%s;%sH\033[48;5;%sm\033[1;38;5;231m %s \033[0m' "$_row" "$_col" "$ui_sel_bg" "$_text" >&3 ;;
+        chip:*)
+            _current="$(cat "$tui_dir/provider" 2>/dev/null)"
+            if [ "site_$_current" = "$1" ]; then
+                printf '\033[%s;%sH\033[1;38;5;%sm %s \033[0m' "$_row" "$_col" "$ui_accent" "$_text" >&3
+            else
+                printf '\033[%s;%sH\033[38;5;245m %s \033[0m' "$_row" "$_col" "$_text" >&3
+            fi
+            ;;
+        *) ;;
+    esac
+}
+
+# $1 = id, $2 = kind, $3 = row, $4 = column, $5 = text. returns the column after it in ui_next
+ui_spot_new() {
+    _w="$(ui_width "$5")"
+    eval "ui_spot_text_$1=\$5 ui_spot_row_$1=\$3 ui_spot_col_$1=\$4 ui_spot_kind_$1=\$2"
+    ui_spot_add "$1" "$3" "$4" "$(($4 + _w + 1))"
+    ui_spot_draw "$1" 0
+    ui_next=$(($4 + _w + 3))
+}
+
+# id of the spot under $1 (column) $2 (row)
+ui_spot_at() {
+    printf "%s" "$ui_spots" | while read -r _id _row _first _last; do
+        [ "$_row" = "$2" ] && [ "$1" -ge "$_first" ] && [ "$1" -le "$_last" ] && printf "%s" "$_id" && break
+    done
+}
+
+ui_footer_draw() {
+    printf '\033[%s;1H\033[48;5;%sm%s\033[0m' "$ui_rows" "$ui_bar_bg" "$ui_bar_blank" >&3
+    ui_spot_new back button "$ui_rows" 2 "‹ Retour"
+    ui_spot_new home button "$ui_rows" "$ui_next" "⌂ Accueil"
+    [ "$ui_in_help" != 1 ] && ui_spot_new help button "$ui_rows" "$ui_next" "? Aide"
+    ui_spot_new quit button "$ui_rows" "$ui_next" "✕ Quitter"
+    _hint="survol : aperçu · clic : choisir · molette : défiler · Échap : retour"
+    [ "$ui_multi" = 1 ] && _hint="clic droit ou Tab : en cocher plusieurs · Entrée : lancer"
+    _w="$(ui_width "$_hint")"
+    [ $((ui_next + _w + 2)) -lt "$ui_cols" ] &&
+        printf '\033[%s;%sH\033[48;5;%sm\033[38;5;243m%s\033[0m' "$ui_rows" "$((ui_cols - _w - 1))" "$ui_bar_bg" "$_hint" >&3
+}
+
+# the site chips of the search
+ui_chips_draw() {
+    if [ "$1" = redraw ]; then
+        for _id in site_all site_animesama site_franime; do
+            _hover=0
+            [ "$_id" = "$ui_hovered" ] && _hover=1
+            ui_spot_draw "$_id" "$_hover"
+        done
+        return 0
+    fi
+    printf '\033[%s;3H\033[38;5;245mSite\033[0m' "$ui_chips_row" >&3
+    ui_spot_new site_all chip "$ui_chips_row" 9 "● Tous"
+    ui_spot_new site_animesama chip "$ui_chips_row" "$ui_next" "● anime-sama"
+    ui_spot_new site_franime chip "$ui_chips_row" "$ui_next" "● franime"
+    printf '\033[%s;%sH\033[38;5;240mclic ou ctrl-s\033[0m' "$ui_chips_row" "$((ui_next + 2))" >&3
+}
+
+# LIST
+
+# the view holds (value \t shown label \t other fields) of the lines matching the query.
+# a label too long for the box loses its colours and is cut with an ellipsis, one sed run does it for every line
+# sets ui_fitted to $1 cut to $2 characters, a cut line loses its colours
+ui_fit() {
+    _fit_plain="$(printf "%s" "$1" | LC_ALL=C sed "s/${ui_e}\\[[0-9;]*m//g")"
+    _fit_width="$(ui_width "$_fit_plain")"
+    ui_fitted="$1"
+    [ "$_fit_width" -le "$2" ] && return 0
+    _fit_plain="$(printf "%s" "$_fit_plain" | LC_ALL=C sed "s/^\\(\\([^$ui_cont][$ui_cont]*\\)\\{$(($2 - 1))\\}\\).*/\\1/")"
+    ui_fitted="${ui_e}[2m$_fit_plain…"
+}
+
+ui_view() {
+    _n=$((ui_lw - 6))
+    [ "$ui_multi" = 1 ] && _n=$((_n - 2))
+    [ "$_n" -gt 250 ] && _n=250
+    [ "$_n" -lt 4 ] && _n=4
+    _e="$ui_e"
+    _c="$ui_cont"
+    _m="$ui_cut"
+    if [ -n "$ui_query" ] && [ "$ui_live" != 1 ] && [ "$ui_ask" != 1 ]; then
+        grep -i -F -- "$ui_query" "$ui_dir/items"
+    else
+        cat "$ui_dir/items"
+    fi | LC_ALL=C sed -e "/^[^	]*	[^	]*\$/s/\$/	/" \
+        -e "s/^\\([^	]*\\)	\\([^	]*\\)	\\(.*\\)\$/\\1	\\2	\\3	\\2/" \
+        -e ":a" -e "s/^\\(.*	[^	$_e]*\\)${_e}\\[[0-9;]*m\\([^	]*\\)\$/\\1\\2/" -e "ta" \
+        -e "s/^\\(.*	\\)\\(\\([^	$_c][$_c]*\\)\\{$_n\\}\\)[^	][^	]*\$/\\1\\2$_m/" \
+        -e "/$_m\$/{" -e "s/^\\([^	]*\\)	[^	]*	\\(.*\\)	\\([^	]*\\)$_m\$/\\1	\\3…	\\2/" -e "b" -e "}" \
+        -e "s/^\\([^	]*\\)	\\([^	]*\\)	\\(.*\\)	[^	]*\$/\\1	\\2	\\3/" \
+        -e "s/${_e}\\[0m/${_e}[22;39m/g" >"$ui_dir/view"
+    ui_count="$(grep -c '' "$ui_dir/view")"
+}
+
+# the lines shown in the box are kept in ui_row_N
+ui_window() {
+    _i=0
+    while [ "$_i" -lt "$ui_ih" ]; do
+        _i=$((_i + 1))
+        eval "ui_row_$_i=''"
+    done
+    _rows="$(sed -n "${ui_top},$((ui_top + ui_ih - 1))p" "$ui_dir/view")"
+    _i=0
+    while IFS= read -r _line; do
+        _i=$((_i + 1))
+        eval "ui_row_$_i=\$_line"
+    done <<EOF
+$_rows
+EOF
+}
+
+# $1 = row of the box
+ui_row() {
+    eval "_line=\"\${ui_row_$1-}\""
+    _y=$((ui_iy + $1 - 1))
+    _x=$((ui_lx + 1))
+    if [ -z "$_line" ]; then
+        printf '\033[%s;%sH%s' "$_y" "$_x" "$ui_blank" >&3
+        [ "$1" = 1 ] && [ "$ui_count" = 0 ] && [ -n "$ui_empty" ] && [ "$ui_empty_width" -lt $((ui_lw - 4)) ] && printf '\033[%s;%sH\033[38;5;243m%s\033[0m' "$_y" "$((_x + 2))" "$ui_empty" >&3
+        return 0
+    fi
+    _value="${_line%%	*}"
+    _text="${_line#*	}"
+    _text="${_text%%	*}"
+    _mark=""
+    if [ "$ui_multi" = 1 ]; then
+        case "$ui_marked" in
+            *"
+$_value
+"*) _mark="$(printf '\033[1;32m✓\033[22;39m ')" ;;
+            *) _mark="  " ;;
+        esac
+    fi
+    if [ $((ui_top + $1 - 1)) = "$ui_cursor" ]; then
+        ui_color "$ui_frame"
+        printf '\033[%s;%sH\033[48;5;%sm%s\033[%s;%sH\033[38;5;%sm▌\033[39m \033[1m%s%s\033[0m' \
+            "$_y" "$_x" "$ui_sel_bg" "$ui_blank" "$_y" "$_x" "$ui_c" "$_mark" "$_text" >&3
+    else
+        printf '\033[%s;%sH%s\033[%s;%sH  %s%s\033[0m' "$_y" "$_x" "$ui_blank" "$_y" "$_x" "$_mark" "$_text" >&3
+    fi
+}
+
+ui_rows_draw() {
+    _r=0
+    while [ "$_r" -lt "$ui_ih" ]; do
+        _r=$((_r + 1))
+        ui_row "$_r"
+    done
+    ui_scroll_draw
+}
+
+# the list appears line after line when a menu opens
+ui_rows_cascade() {
+    _r=0
+    while [ "$_r" -lt "$ui_ih" ]; do
+        _r=$((_r + 1))
+        ui_row "$_r"
+        eval "_line=\"\${ui_row_$_r-}\""
+        [ -n "$_line" ] && [ $((_r % 2)) = 0 ] && [ "$_r" -le 24 ] && sleep 0.012
+    done
+    ui_scroll_draw
+}
+
+# scroll bar on the right border and the position in the bottom one
+ui_scroll_draw() {
+    _x=$((ui_lx + ui_lw - 1))
+    _y=$((ui_ly + ui_lh - 1))
+    _bottom="$(ui_repeat "─" $((ui_lw - 2)))"
+    printf '\033[%s;%sH\033[38;5;%sm%s' "$_y" "$((ui_lx + 1))" "$ui_border" "$_bottom" >&3
+    if [ "$ui_count" -gt 0 ]; then
+        _pos=" $ui_cursor/$ui_count "
+        [ "$ui_multi" = 1 ] && [ "$ui_marked_count" -gt 0 ] && _pos=" $ui_marked_count cochés · $ui_cursor/$ui_count "
+        printf '\033[%s;%sH\033[38;5;245m%s' "$_y" "$((_x - ${#_pos} - 1))" "$_pos" >&3
+    fi
+    if [ "$ui_count" -gt "$ui_ih" ]; then
+        _size=$((ui_ih * ui_ih / ui_count))
+        [ "$_size" -lt 1 ] && _size=1
+        _start=$(((ui_top - 1) * (ui_ih - _size) / (ui_count - ui_ih)))
+        _r=0
+        while [ "$_r" -lt "$ui_ih" ]; do
+            if [ "$_r" -ge "$_start" ] && [ "$_r" -lt $((_start + _size)) ]; then
+                printf '\033[%s;%sH\033[38;5;%sm┃' "$((ui_iy + _r))" "$_x" "$ui_accent2" >&3
+            else
+                printf '\033[%s;%sH\033[38;5;%sm│' "$((ui_iy + _r))" "$_x" "$ui_border" >&3
+            fi
+            _r=$((_r + 1))
+        done
+    fi
+    printf '\033[0m' >&3
+}
+
+# moves the highlighted line to $1, scrolls when it leaves the box
+ui_move() {
+    [ "$ui_count" -eq 0 ] && return 0
+    _new="$1"
+    [ "$_new" -lt 1 ] && _new=1
+    [ "$_new" -gt "$ui_count" ] && _new="$ui_count"
+    [ "$_new" = "$ui_cursor" ] && return 0
+    _old="$ui_cursor"
+    ui_cursor="$_new"
+    if [ "$_new" -lt "$ui_top" ]; then
+        ui_top="$_new"
+        ui_window
+        ui_rows_draw
+    elif [ "$_new" -ge $((ui_top + ui_ih)) ]; then
+        ui_top=$((_new - ui_ih + 1))
+        ui_window
+        ui_rows_draw
+    else
+        [ "$_old" -ge "$ui_top" ] && [ "$_old" -lt $((ui_top + ui_ih)) ] && ui_row $((_old - ui_top + 1))
+        ui_row $((_new - ui_top + 1))
+        ui_scroll_draw
+    fi
+    ui_pv_pending=1
+}
+
+# the wheel moves the box, the highlighted line stays under the pointer
+ui_scroll() {
+    [ "$ui_count" -le "$ui_ih" ] && ui_move $((ui_cursor + $1)) && return 0
+    _top=$((ui_top + $1))
+    _max=$((ui_count - ui_ih + 1))
+    [ "$_top" -gt "$_max" ] && _top="$_max"
+    [ "$_top" -lt 1 ] && _top=1
+    [ "$_top" = "$ui_top" ] && return 0
+    ui_cursor=$((ui_cursor + _top - ui_top))
+    ui_top="$_top"
+    ui_window
+    ui_rows_draw
+    ui_pv_pending=1
+}
+
+ui_value() {
+    eval "_line=\"\${ui_row_$((ui_cursor - ui_top + 1))-}\""
+    printf "%s" "${_line%%	*}"
+}
+
+ui_input_draw() {
+    [ "$ui_input" = 1 ] || return 0
+    _x=$((ui_lx + 2))
+    _y=$((ui_ly + 1))
+    printf '\033[%s;%sH%s\033[%s;%sH\033[1;38;5;%sm❯\033[0m ' "$_y" "$((ui_lx + 1))" "$ui_blank" "$_y" "$_x" "$ui_accent" >&3
+    if [ -n "$ui_query" ]; then
+        printf '\033[1m%s\033[0m\033[38;5;%sm▏\033[0m' "$ui_query" "$ui_accent" >&3
+    elif [ "$ui_ghost_width" -lt $((ui_lw - 6)) ]; then
+        printf '\033[38;5;%sm▏\033[38;5;243m%s\033[0m' "$ui_accent" "$ui_ghost" >&3
+    else
+        printf '\033[38;5;%sm▏\033[0m' "$ui_accent" >&3
+    fi
+}
+
+# PREVIEW
+
+ui_pv_draw() {
+    [ "$ui_px" -gt 0 ] || return 0
+    _x=$((ui_px + 2))
+    _first=$((ui_pv_off + 1))
+    _lines="$(sed -n "${_first},$((ui_pv_off + ui_ph - 2))p" "$1" 2>/dev/null)"
+    _row=$((ui_py + 1))
+    _end=$((ui_py + ui_ph - 1))
+    while IFS= read -r _l; do
+        [ "$_row" -ge "$_end" ] && break
+        printf '\033[%s;%sH%s\033[%s;%sH%s\033[0m\033[%s;%sH\033[38;5;%sm│\033[0m' "$_row" "$((ui_px + 1))" "$ui_pv_blank" "$_row" "$_x" "$_l" "$_row" "$((ui_px + ui_pw - 1))" "$ui_border" >&3
+        _row=$((_row + 1))
+    done <<EOF
+$_lines
+EOF
+    while [ "$_row" -lt "$_end" ]; do
+        printf '\033[%s;%sH%s' "$_row" "$((ui_px + 1))" "$ui_pv_blank" >&3
+        _row=$((_row + 1))
+    done
+}
+
+# previews are made in the background and kept for the session
+ui_pv_request() {
+    # no preview when the terminal is too narrow for it
+    [ "$ui_px" -gt 0 ] || return 0
+    _value="$(ui_value)"
+    [ "$_value" = "$ui_pv_value" ] && return 0
+    ui_pv_value="$_value"
+    ui_pv_off=0
+    if [ -z "$_value" ] || [ "$_value" = "none" ]; then
+        ui_pv_file="$ui_dir/empty"
+        : >"$ui_pv_file"
+        ui_pv_draw "$ui_pv_file"
+        return 0
+    fi
+    _key="$(printf "%s" "$ui_pv_cmd$ui_pw$_value" | tr -c 'A-Za-z0-9' '_')"
+    ui_pv_file="$tui_dir/pv/$_key"
+    [ -d "$tui_dir/pv" ] || mkdir -p "$tui_dir/pv"
+    if [ -f "$ui_pv_file" ]; then
+        ui_pv_loading=0
+        ui_label "$ui_px" "$ui_py" "$ui_pv_title" ""
+        ui_pv_draw "$ui_pv_file"
+        return 0
+    fi
+    [ -n "$ui_pv_pid" ] && kill "$ui_pv_pid" 2>/dev/null
+    (
+        FZF_PREVIEW_COLUMNS=$((ui_pw - 4)) FZF_PREVIEW_LINES=$((ui_ph - 2))
+        export FZF_PREVIEW_COLUMNS FZF_PREVIEW_LINES
+        _width=$((ui_pw - 4))
+        sh "$self" "$ui_pv_cmd" "$_value" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do
+            # lines without colours that do not fit are wrapped on words
+            case "$_l" in
+                *"$ui_e"*) printf "%s\n" "$_l" ;;
+                *) if [ "${#_l}" -gt "$_width" ]; then printf "%s\n" "$_l" | fold -s -w "$_width"; else printf "%s\n" "$_l"; fi ;;
+            esac
+        done >"$ui_pv_file.tmp"
+        mv "$ui_pv_file.tmp" "$ui_pv_file"
+    ) </dev/null >/dev/null 2>&1 &
+    ui_pv_pid=$!
+    ui_pv_loading=1
+}
+
+ui_pv_check() {
+    [ "$ui_pv_loading" = 1 ] && [ -f "$ui_pv_file" ] || return 0
+    ui_pv_loading=0
+    ui_pv_pid=""
+    [ "$ui_px" -gt 0 ] || return 0
+    ui_label "$ui_px" "$ui_py" "$ui_pv_title" ""
+    ui_pv_draw "$ui_pv_file"
+}
+
+# LIVE SEARCH
+
+ui_search_start() {
+    [ -n "$ui_search_pid" ] && kill "$ui_search_pid" 2>/dev/null
+    ui_job=$((ui_job + 1))
+    ui_search_file="$ui_dir/results.$ui_job"
+    _query="$ui_query"
+    (
+        sh "$self" --tui-search "$_query" >"$ui_search_file.tmp" 2>/dev/null
+        mv "$ui_search_file.tmp" "$ui_search_file"
+    ) </dev/null >/dev/null 2>&1 &
+    ui_search_pid=$!
+    ui_loading=1
+}
+
+ui_search_check() {
+    [ "$ui_loading" = 1 ] && [ -f "$ui_search_file" ] || return 0
+    ui_loading=0
+    ui_search_pid=""
+    mv "$ui_search_file" "$ui_dir/items"
+    ui_list_reset
+    ui_label "$ui_lx" "$ui_ly" "$ui_title" ""
+}
+
+# after the lines or the query changed
+ui_list_reset() {
+    ui_view
+    ui_cursor=1
+    ui_top=1
+    ui_window
+    ui_rows_draw
+    ui_pv_value="-"
+    ui_pv_pending=1
+}
+
+# LAYOUT
+
+ui_layout() {
+    ui_size
+    ui_bar_blank="$(ui_repeat " " "$ui_cols")"
+    _header_lines=0
+    [ -n "$ui_header" ] && _header_lines="$(printf "%s\n" "$ui_header" | grep -c '')"
+    [ "$ui_logo" = 1 ] && _header_lines=$((_header_lines + 4))
+    [ "$ui_chips" = 1 ] && _header_lines=$((_header_lines + 1))
+    ui_ly=3
+    [ "$_header_lines" -gt 0 ] && ui_ly=$((4 + _header_lines))
+    ui_lh=$((ui_rows - ui_ly))
+    [ "$ui_lh" -lt 5 ] && ui_lh=5
+    ui_lx=1
+    ui_lw="$ui_cols"
+    if [ -n "$ui_pv_cmd" ] && [ "$ui_cols" -ge 70 ]; then
+        ui_lw=$((ui_cols * ${ui_pv_split:-52} / 100))
+        ui_px=$((ui_lw + 1))
+        ui_pw=$((ui_cols - ui_lw))
+        ui_py="$ui_ly"
+        ui_ph="$ui_lh"
+        ui_pv_blank="$(ui_repeat " " $((ui_pw - 2)))"
+    else
+        ui_px=0
+    fi
+    ui_iy=$((ui_ly + 1))
+    [ "$ui_input" = 1 ] && ui_iy=$((ui_ly + 3))
+    ui_ih=$((ui_ly + ui_lh - 1 - ui_iy))
+    [ "$ui_ih" -lt 1 ] && ui_ih=1
+    ui_blank="$(ui_repeat " " $((ui_lw - 2)))"
+    ui_empty_width="$(ui_width "$ui_empty")"
+    ui_ghost_width="$(ui_width "$ui_ghost")"
+    ui_view
+    [ "$ui_cursor" -gt "$ui_count" ] && ui_cursor="$ui_count"
+    [ "$ui_cursor" -lt 1 ] && ui_cursor=1
+    ui_top=1
+    [ "$ui_cursor" -gt "$ui_ih" ] && ui_top=$((ui_cursor - ui_ih / 2))
+    [ "$ui_top" -gt $((ui_count - ui_ih + 1)) ] && ui_top=$((ui_count - ui_ih + 1))
+    [ "$ui_top" -lt 1 ] && ui_top=1
+    ui_window
+}
+
+# $1 = 1 to let the lines appear one after the other
+ui_draw_all() {
+    ui_spots=""
+    printf '\033[?2026h\033[0m\033[H\033[2J' >&3
+    ui_title_draw
+    _row=3
+    if [ "$ui_logo" = 1 ]; then
+        ui_logo_draw 4 3 "$ui_frame"
+        printf '\033[6;4H\033[38;5;245mv%s · VOSTFR et VF · anime-sama + franime\033[0m' "$version_number" >&3
+        _row=7
+    fi
+    if [ -n "$ui_header" ]; then
+        while IFS= read -r _l; do
+            ui_fit "$_l" $((ui_cols - 4))
+            printf '\033[%s;3H%s\033[0m' "$_row" "$ui_fitted" >&3
+            _row=$((_row + 1))
+        done <<EOF
+$ui_header
+EOF
+    fi
+    if [ "$ui_chips" = 1 ]; then
+        ui_chips_row="$_row"
+        ui_chips_draw
+    fi
+    ui_box "$ui_lx" "$ui_ly" "$ui_lw" "$ui_lh"
+    ui_label "$ui_lx" "$ui_ly" "$ui_title" ""
+    if [ "$ui_input" = 1 ]; then
+        _line="$(ui_repeat "─" $((ui_lw - 2)))"
+        printf '\033[%s;%sH\033[38;5;%sm├%s┤\033[0m' "$((ui_ly + 2))" "$ui_lx" "$ui_border" "$_line" >&3
+        ui_input_draw
+    fi
+    if [ "$ui_px" -gt 0 ]; then
+        ui_box "$ui_px" "$ui_py" "$ui_pw" "$ui_ph"
+        ui_label "$ui_px" "$ui_py" "$ui_pv_title" ""
+    fi
+    ui_footer_draw
+    if [ "$1" = 1 ] && [ "$ui_anim" = 1 ]; then
+        printf '\033[?2026l' >&3
+        ui_rows_cascade
+    else
+        ui_rows_draw
+        printf '\033[?2026l' >&3
+    fi
+    ui_pv_value="-"
+    ui_pv_pending=1
+}
+
+# INPUT
+
+ui_hover_spot() {
+    [ "$1" = "$ui_hovered" ] && return 0
+    [ -n "$ui_hovered" ] && ui_spot_draw "$ui_hovered" 0
+    ui_hovered="$1"
+    [ -n "$1" ] && ui_spot_draw "$1" 1
+}
+
+# what a click on a spot does
+ui_spot_action() {
+    case "$1" in
+        back) ui_result=back ;;
+        home) ui_result=home ;;
+        quit) ui_result=quit ;;
+        help) ui_help ;;
+        site_*)
+            tui_set_site "${1#site_}"
+            ui_chips_draw redraw
+            [ -n "$ui_query" ] && ui_search_start && ui_label "$ui_lx" "$ui_ly" "$ui_title" 0
+            ;;
+        *) ;;
+    esac
+}
+
+# the help opens over any menu, the menu is drawn again when it closes
+ui_help() {
+    [ "$ui_in_help" = 1 ] && return 0
+    _after="$(tui_help)"
+    case "$_after" in
+        @home) ui_result=home ;;
+        @quit) ui_result=quit ;;
+        *)
+            ui_layout
+            ui_draw_all 0
+            ;;
+    esac
+}
+
+ui_mouse() {
+    _button="$1"
+    _x="$2"
+    _y="$3"
+    _in_list=0
+    if [ "$_x" -gt "$ui_lx" ] && [ "$_x" -lt $((ui_lx + ui_lw - 1)) ] && [ "$_y" -ge "$ui_iy" ] && [ "$_y" -lt $((ui_iy + ui_ih)) ]; then
+        _index=$((ui_top + _y - ui_iy))
+        [ "$_index" -le "$ui_count" ] && _in_list=1
+    fi
+    _in_preview=0
+    [ "$ui_px" -gt 0 ] && [ "$_x" -ge "$ui_px" ] && [ "$_y" -gt "$ui_py" ] && [ "$_y" -lt $((ui_py + ui_ph)) ] && _in_preview=1
+    case "$_button:$4" in
+        3[2-5]:M)
+            # the pointer moved
+            if [ "$_in_list" = 1 ]; then
+                ui_hover_spot ""
+                ui_move "$_index"
+            elif [ "$_y" = "$ui_rows" ] || [ "$_y" = "$ui_chips_row" ]; then
+                _spot="$(ui_spot_at "$_x" "$_y")"
+                ui_hover_spot "$_spot"
+            else
+                ui_hover_spot ""
+            fi
+            ;;
+        0:M)
+            if [ "$_in_list" = 1 ]; then
+                ui_move "$_index"
+                ui_result=accept
+            else
+                _spot="$(ui_spot_at "$_x" "$_y")"
+                [ -n "$_spot" ] && ui_spot_action "$_spot"
+            fi
+            ;;
+        2:M)
+            if [ "$_in_list" = 1 ] && [ "$ui_multi" = 1 ]; then
+                ui_move "$_index"
+                ui_toggle
+            fi
+            ;;
+        64:M)
+            if [ "$_in_preview" = 1 ]; then
+                [ "$ui_pv_off" -gt 0 ] && ui_pv_off=$((ui_pv_off - 3)) && [ "$ui_pv_off" -lt 0 ] && ui_pv_off=0
+                ui_pv_draw "$ui_pv_file"
+            else
+                ui_scroll -3
+            fi
+            ;;
+        65:M)
+            if [ "$_in_preview" = 1 ]; then
+                _total="$(grep -c '' "$ui_pv_file" 2>/dev/null)"
+                [ $((ui_pv_off + ui_ph - 2)) -lt "${_total:-0}" ] && ui_pv_off=$((ui_pv_off + 3))
+                ui_pv_draw "$ui_pv_file"
+            else
+                ui_scroll 3
+            fi
+            ;;
+        *) ;;
+    esac
+}
+
+ui_toggle() {
+    _value="$(ui_value)"
+    [ -z "$_value" ] && return 0
+    case "$ui_marked" in
+        *"
+$_value
+"*)
+            ui_marked="$(printf "%s" "$ui_marked" | grep -v -x -F -- "$_value")
+"
+            ui_marked="
+${ui_marked#
+}"
+            ui_marked_count=$((ui_marked_count - 1))
+            ;;
+        *)
+            ui_marked="$ui_marked$_value
+"
+            ui_marked_count=$((ui_marked_count + 1))
+            ;;
+    esac
+    ui_row $((ui_cursor - ui_top + 1))
+    ui_scroll_draw
+}
+
+ui_query_changed() {
+    ui_input_draw
+    if [ "$ui_live" = 1 ]; then
+        ui_search_due=3
+    elif [ "$ui_ask" != 1 ]; then
+        ui_list_reset
+    fi
+}
+
+# $1 = bytes read from the terminal, several keys or mouse reports may come at once
+ui_keys() {
+    _buffer="$1"
+    while [ -n "$_buffer" ] && [ -z "$ui_result" ]; do
+        case "$_buffer" in
+            "${ui_e}[<"*)
+                _rest="${_buffer#"${ui_e}[<"}"
+                _b="${_rest%%;*}"
+                _rest="${_rest#*;}"
+                _mx="${_rest%%;*}"
+                _rest="${_rest#*;}"
+                _my="${_rest%%[Mm]*}"
+                _rest="${_rest#"$_my"}"
+                _kind="${_rest%"${_rest#?}"}"
+                _buffer="${_rest#?}"
+                case "$_b$_mx$_my" in
+                    *[!0-9]*) _buffer="" ;;
+                    *) ui_mouse "$_b" "$_mx" "$_my" "$_kind" ;;
+                esac
+                continue
+                ;;
+            "${ui_e}[A"* | "$ui_e"OA*) ui_move $((ui_cursor - 1)) ;;
+            "${ui_e}[B"* | "$ui_e"OB*) ui_move $((ui_cursor + 1)) ;;
+            "${ui_e}[5~"*) ui_move $((ui_cursor - ui_ih)) ;;
+            "${ui_e}[6~"*) ui_move $((ui_cursor + ui_ih)) ;;
+            "${ui_e}[H"* | "${ui_e}[1~"* | "$ui_e"OH*) ui_move 1 ;;
+            "${ui_e}[F"* | "${ui_e}[4~"* | "$ui_e"OF*) ui_move "$ui_count" ;;
+            "$ui_e"OP* | "${ui_e}[11~"*) ui_help ;;
+            "${ui_e}[Z"*)
+                [ "$ui_multi" = 1 ] && ui_toggle
+                ui_move $((ui_cursor - 1))
+                ;;
+            "${ui_e}["*)
+                # other sequences end with a letter or a tilde
+                _rest="${_buffer#"${ui_e}["}"
+                _seq="${_rest%%[A-Za-z~]*}"
+                _buffer="${_rest#"$_seq"}"
+                _buffer="${_buffer#?}"
+                continue
+                ;;
+            "$ui_e"O?*) ;;
+            "$ui_e")
+                ui_result=back
+                _buffer=""
+                continue
+                ;;
+            "$ui_e"*)
+                _buffer="${_buffer#?}"
+                _buffer="${_buffer#?}"
+                continue
+                ;;
+            "$ui_cr"*)
+                if [ "$ui_ask" = 1 ]; then
+                    [ -n "$ui_query" ] && ui_result=query
+                elif [ "$ui_count" -gt 0 ]; then
+                    ui_result=accept
+                fi
+                _buffer="${_buffer#?}"
+                continue
+                ;;
+            "$ui_tab"*)
+                if [ "$ui_multi" = 1 ]; then
+                    ui_toggle
+                    ui_move $((ui_cursor + 1))
+                fi
+                _buffer="${_buffer#?}"
+                continue
+                ;;
+            "$ui_del"* | "$ui_bs"*)
+                if [ "$ui_input" = 1 ] && [ -n "$ui_query" ]; then
+                    # an accented letter is several bytes, they go until the first one
+                    while [ -n "$ui_query" ]; do
+                        _last="${ui_query#"${ui_query%?}"}"
+                        ui_query="${ui_query%?}"
+                        case "$_last" in
+                            [$ui_cont]) ;;
+                            *) break ;;
+                        esac
+                    done
+                    ui_query_changed
+                fi
+                _buffer="${_buffer#?}"
+                continue
+                ;;
+            "$ui_ctrl_u"*)
+                [ "$ui_input" = 1 ] && ui_query="" && ui_query_changed
+                _buffer="${_buffer#?}"
+                continue
+                ;;
+            "$ui_ctrl_q"*)
+                ui_result=quit
+                _buffer=""
+                continue
+                ;;
+            "$ui_ctrl_s"*)
+                if [ "$ui_chips" = 1 ]; then
+                    tui_set_site next
+                    ui_chips_draw redraw
+                    [ -n "$ui_query" ] && ui_search_start
+                fi
+                _buffer="${_buffer#?}"
+                continue
+                ;;
+            "$ui_ctrl_d"*)
+                if [ "$ui_forget" = 1 ] && [ "$ui_count" -gt 0 ]; then
+                    _value="$(ui_value)"
+                    tui_forget "${_value#hist:}"
+                    grep -v -F -- "$_value	" "$ui_dir/items" >"$ui_dir/items.new"
+                    mv "$ui_dir/items.new" "$ui_dir/items"
+                    _keep="$ui_cursor"
+                    ui_list_reset
+                    ui_move "$_keep"
+                fi
+                _buffer="${_buffer#?}"
+                continue
+                ;;
+            "$ui_ctrl_n"*) ui_move $((ui_cursor + 1)) ;;
+            "$ui_ctrl_p"*) ui_move $((ui_cursor - 1)) ;;
+            [$ui_ctrl]*)
+                _buffer="${_buffer#?}"
+                continue
+                ;;
+            *)
+                # typed text goes to the query up to the next control byte
+                # shellcheck disable=SC2295
+                _text="${_buffer%%[$ui_ctrl]*}"
+                _buffer="${_buffer#"$_text"}"
+                if [ "$ui_input" = 1 ]; then
+                    ui_query="$ui_query$_text"
+                    ui_query_changed
+                fi
+                continue
+                ;;
+        esac
+        # the arrows and the like are three or four bytes long
+        case "$_buffer" in
+            "${ui_e}["[0-9]*) _buffer="${_buffer#*[~]}" ;;
+            "$ui_e"*) _buffer="${_buffer#???}" ;;
+            *) _buffer="${_buffer#?}" ;;
+        esac
+    done
+}
+
+# ANIMATION
+
+# every tenth of a second without input: previews and searches start, the highlight and the logo shimmer
+ui_tick() {
+    ui_frame=$((ui_frame + 1))
+    if [ "$ui_pv_pending" = 1 ]; then
+        ui_pv_pending=0
+        ui_pv_request
+    fi
+    if [ "$ui_search_due" -gt 0 ]; then
+        ui_search_due=$((ui_search_due - 1))
+        if [ "$ui_search_due" = 0 ]; then
+            if [ -n "$ui_query" ]; then
+                ui_search_start
+            else
+                [ -n "$ui_search_pid" ] && kill "$ui_search_pid" 2>/dev/null
+                ui_loading=0
+                : >"$ui_dir/items"
+                ui_list_reset
+                ui_label "$ui_lx" "$ui_ly" "$ui_title" ""
+            fi
+        fi
+    fi
+    [ "$ui_anim" = 1 ] || return 0
+    if [ "$ui_count" -gt 0 ] && [ "$ui_cursor" -ge "$ui_top" ] && [ "$ui_cursor" -lt $((ui_top + ui_ih)) ]; then
+        ui_color "$ui_frame"
+        printf '\033[%s;%sH\033[48;5;%sm\033[38;5;%sm▌\033[0m' "$((ui_iy + ui_cursor - ui_top))" "$((ui_lx + 1))" "$ui_sel_bg" "$ui_c" >&3
+    fi
+    [ "$ui_loading" = 1 ] && ui_label "$ui_lx" "$ui_ly" "$ui_title" "$ui_frame"
+    [ "$ui_pv_loading" = 1 ] && [ "$ui_px" -gt 0 ] && ui_label "$ui_px" "$ui_py" "$ui_pv_title" "$ui_frame"
+    [ "$ui_logo" = 1 ] && ui_logo_draw 4 3 "$ui_frame"
+}
+
+# loading screens animate in the background until the next screen stops them
+ui_anim_stop() {
+    [ -n "$tui_dir" ] || return 0
+    rm -f "$tui_dir/anim.on"
+    _pid="$(cat "$tui_dir/anim.pid" 2>/dev/null)"
+    [ -n "$_pid" ] && kill "$_pid" 2>/dev/null
+    rm -f "$tui_dir/anim.pid"
+}
+
+# $1 = message
+ui_loading_screen() {
+    ui_anim_stop
+    ui_size
+    ui_bar_blank="$(ui_repeat " " "$ui_cols")"
+    ui_title="Chargement"
+    _x=$(((ui_cols - 26) / 2))
+    _y=$((ui_rows / 2 - 3))
+    _w="$(ui_width "$1")"
+    _mx=$(((ui_cols - _w - 2) / 2))
+    printf '\033[?2026h\033[0m\033[H\033[2J' >&3
+    ui_title_draw
+    ui_logo_draw "$_x" "$_y" 0
+    printf '\033[%s;%sH\033[38;5;250m%s\033[0m\033[?2026l' "$((_y + 5))" "$((_mx + 2))" "$1" >&3
+    [ "$ui_anim" = 1 ] || return 0
+    : >"$tui_dir/anim.on"
+    # started from a subshell so that the wait for the player does not wait for it
+    (
+        (
+            _frame=0
+            while [ -f "$tui_dir/anim.on" ]; do
+                _frame=$((_frame + 1))
+                ui_logo_draw "$_x" "$_y" "$_frame"
+                ui_spinner "$_frame"
+                ui_color "$_frame"
+                printf '\033[%s;%sH\033[38;5;%sm%s\033[0m' "$((_y + 5))" "$_mx" "$ui_c" "$ui_s" >&3
+                sleep 0.08
+            done
+        ) </dev/null >/dev/null 2>&1 &
+        printf "%s" "$!" >"$tui_dir/anim.pid"
+    )
+}
+
+# MENU
+
+# one menu over the (value \t label [\t more]) lines of stdin, the options are the ui_* variables set by ui_reset.
+# prints the chosen lines (the query first with ui_print_query), @home or @quit, nothing when left
+ui_menu() {
+    ui_anim_stop
+    ui_depth=$((${ui_depth:-0} + 1))
+    ui_dir="$tui_dir/menu$ui_depth"
+    rm -rf "$ui_dir"
+    mkdir -p "$ui_dir"
+    cat >"$ui_dir/items"
+    trap 'ui_resized=1' WINCH
+    ui_cursor="${ui_start:-1}"
+    ui_top=1
+    ui_frame=0
+    ui_result=""
+    ui_marked="
+"
+    ui_marked_count=0
+    ui_hovered=""
+    ui_pv_value="-"
+    ui_pv_file="$ui_dir/empty"
+    : >"$ui_pv_file"
+    ui_pv_off=0
+    ui_pv_pid=""
+    ui_pv_loading=0
+    ui_pv_pending=0
+    ui_search_pid=""
+    ui_search_due=0
+    ui_loading=0
+    ui_job=0
+    ui_resized=0
+    ui_layout
+    ui_draw_all 1
+    [ "$ui_live" = 1 ] && [ -n "$ui_query" ] && ui_search_start
+    # what was typed while loading is dropped
+    stty min 0 time 0 </dev/tty
+    while :; do
+        _junk="$(dd bs=4096 count=1 2>/dev/null </dev/tty)"
+        [ -z "$_junk" ] && break
+    done
+    stty min 0 time 1 </dev/tty
+    while [ -z "$ui_result" ]; do
+        if [ "$ui_resized" = 1 ]; then
+            ui_resized=0
+            ui_layout
+            ui_draw_all 0
+        fi
+        _input="$(dd bs=4096 count=1 2>/dev/null </dev/tty)"
+        if [ -z "$_input" ]; then
+            ui_tick
+        else
+            ui_keys "$_input"
+            # some menus only close on one of their lines, the others are just shown
+            if [ "$ui_result" = accept ] && [ -n "$ui_accept_only" ]; then
+                _value="$(ui_value)"
+                [ "$_value" != "$ui_accept_only" ] && ui_result=""
+            fi
+        fi
+        [ "$ui_live" = 1 ] && ui_search_check
+        ui_pv_check
+    done
+    [ -n "$ui_pv_pid" ] && kill "$ui_pv_pid" 2>/dev/null
+    [ -n "$ui_search_pid" ] && kill "$ui_search_pid" 2>/dev/null
+    [ "$ui_print_query" = 1 ] && printf "%s\n" "$ui_query"
+    case "$ui_result" in
+        accept)
+            if [ "$ui_marked_count" -gt 0 ]; then
+                printf "%s" "$ui_marked" | sed '/^$/d'
+            else
+                eval "_line=\"\${ui_row_$((ui_cursor - ui_top + 1))-}\""
+                printf "%s\n" "$_line"
+            fi
+            ;;
+        query) [ "$ui_print_query" = 1 ] || printf "%s\n" "$ui_query" ;;
+        home) printf "@home\n" ;;
+        quit) printf "@quit\n" ;;
+        *) ;;
+    esac
+    rm -rf "$ui_dir"
+    return 0
+}
+
+# the options of the next menu
+ui_reset() {
+    ui_title="$1"
+    ui_header=""
+    ui_pv_cmd=""
+    ui_pv_title="Aperçu"
+    ui_pv_split=52
+    ui_input=0
+    ui_live=0
+    ui_ask=0
+    ui_multi=0
+    ui_logo=0
+    ui_chips=0
+    ui_chips_row=0
+    ui_forget=0
+    ui_print_query=0
+    ui_start=1
+    ui_query=""
+    ui_ghost="tapez pour filtrer"
+    ui_empty=""
+    ui_accept_only=""
+}
+
+tui_pad() {
+    _width="$(printf "%s" "$1" | LC_ALL=C tr -d '\200-\277' | wc -c | tr -d '[:space:]')"
+    printf "%s" "$1"
+    while [ "$_width" -lt "$2" ]; do
+        printf " "
+        _width=$((_width + 1))
+    done
+}
+
+# SEARCH
+
+# $1 = all, animesama, franime or next
+tui_set_site() {
+    _current="$(cat "$tui_dir/provider" 2>/dev/null)"
+    case "$1" in
+        all | animesama | franime) _new="$1" ;;
+        next)
+            case "$_current" in
+                all) _new=animesama ;;
+                animesama) _new=franime ;;
+                *) _new=all ;;
+            esac
+            ;;
+        *) return 0 ;;
+    esac
+    printf "%s" "$_new" >"$tui_dir/provider"
+}
+
+# the live search, sets anime_id, anime_title, anime_list and the query. returns 1 when left
+tui_search() {
+    ui_reset "Rechercher un anime"
+    ui_live=1 ui_input=1 ui_chips=1 ui_print_query=1 ui_pv_cmd="--preview"
+    ui_query="$user_query"
+    ui_header="$(tui_take_notice)"
+    ui_ghost="frieren, one piece, dandadan…"
+    ui_empty="Les résultats arrivent pendant la frappe"
+    _out="$(: | ui_menu)"
+    provider="$(cat "$tui_dir/provider" 2>/dev/null)"
+    _q="$(printf "%s\n" "$_out" | head -n 1)"
+    _line="$(printf "%s\n" "$_out" | sed -n 2p)"
+    case "$_line" in
+        @home) tui_home ;;
+        @quit) exit 0 ;;
+        *) ;;
+    esac
+    user_query="$_q"
+    query="$(printf "%s" "$_q" | sed 's| |+|g')"
+    [ -z "$_line" ] && return 1
+    anime_id="${_line%%	*}"
+    anime_title="${_line##*	}"
+    anime_list="$anime_id	$anime_title"
+    return 0
+}
+
+tui_search_results() {
+    [ -z "$1" ] && return 0
+    provider="$(cat "$tui_dir/provider" 2>/dev/null)"
+    [ "$provider" != "franime" ] && as_resolve_domain 2>/dev/null
+    _q="$(printf "%s" "$1" | sed 's| |+|g')"
+    _list="$(search_anime "$_q" 2>"$tui_dir/search-errors")"
+    _esc="$(printf '\033')"
+    sed -n "s|.*! \(.*\)${_esc}\[0m\$|none	${_esc}[33m! \1${_esc}[0m	|p" "$tui_dir/search-errors" 2>/dev/null
+    if [ -z "$_list" ]; then
+        printf "none\t${c_dim}Aucun résultat pour « %s ». Essayez un autre site ou un autre titre.${c_reset}\t\n" "$1"
+        return 0
+    fi
+    printf "%s\n" "$_list" | sed -e "s|^\(as:[^	]*\)	\(.*\)|\1	\2  ${c_dim}·${c_reset} ${c_as}anime-sama${c_reset}	\2|" \
+        -e "s|^\(fr:[^	]*\)	\(.*\)|\1	\2  ${c_dim}·${c_reset} ${c_fr}franime${c_reset}	\2|"
+}
+
+tui_search_flow() {
+    while :; do
+        tui_search || return 1
+        [ "$anime_id" = "none" ] && continue
+        pick_season
+        _status=$?
+        [ "$_status" = 0 ] && return 0
+        # escape on the seasons goes back to the search
+        [ "$_status" = 1 ] && continue
+        _site="$(other_site)"
+        _site="$(site_label "$_site")"
+        menu_header="Rien à regarder pour $anime_title" menu_preview="" menu_start=""
+        _choice="$({
+            printf "site\t⌕  Chercher « %s » sur %s\n" "$base_title" "$_site"
+            printf "retour\t‹  Revenir à la recherche\n"
+            printf "accueil\t⌂  Retour à l'accueil\n"
+        } | choose "Que faire ?")"
+        case "$_choice" in
+            site) find_on_other_site && return 0 ;;
+            retour) ;;
+            *) return 1 ;;
+        esac
+    done
+}
+
+# HISTORY
+
+# most recent first as (hist:id \t label), read from the file only so it shows at once
+tui_history_list() {
+    [ -s "$histfile" ] || return 0
+    sed '1!G;h;$!d' "$histfile" | while IFS="	" read -r _ep _id _title; do
+        case "$_id" in
+            as:* | fr:*) ;;
+            *) continue ;;
+        esac
+        hist_split "$_id"
+        _label="$(lang_label "$hist_lang")"
+        _site="$(site_label "$hist_anime")"
+        printf "hist:%s\t%s  ${c_dim}·  %s  ·  épisode %s vu  ·  %s${c_reset}\n" "$_id" "$_title" "$_label" "$_ep" "$_site"
+    done
+}
+
+# $1 = history id
+tui_forget() {
+    while IFS="	" read -r _ep _id _title; do
+        [ "$_id" = "$1" ] && continue
+        printf "%s\t%s\t%s\n" "$_ep" "$_id" "$_title"
+    done <"$histfile" >"${histfile}.new"
+    mv "${histfile}.new" "$histfile"
+}
+
+# picks up after the last episode watched, the episode menu shows when the season is finished
+tui_resume() {
+    _hid="$1"
+    _entry="$(while IFS="	" read -r _ep _id _title; do
+        [ "$_id" = "$_hid" ] && printf "%s\t%s\n" "$_ep" "$_title" && break
+    done <"$histfile")"
+    [ -z "$_entry" ] && return 1
+    _seen_ep="${_entry%%	*}"
+    anime_title="${_entry#*	}"
+    base_title="${anime_title% - *}"
+    hist_split "$_hid"
+    anime_id="$hist_anime"
+    mode="$hist_lang"
+    anime_list="$anime_id	$anime_title"
+    status "Chargement de $anime_title…"
+    case "$anime_id" in
+        fr:*) _fr_id="${anime_id#fr:}" && fr_cache_anime "${_fr_id%/*}" ;;
+        *) ;;
+    esac
+    if ! use_language "$hist_lang"; then
+        _site="$(site_label "$anime_id")"
+        warn "Impossible de récupérer les épisodes de $anime_title sur $_site"
+        ep_no=""
+        find_on_other_site
+        return
+    fi
+    ep_no="$(printf "%s\n" "$ep_list" | sed -n "/^${_seen_ep}$/{n;p;}")"
+    [ -z "$ep_no" ] && note "Vous avez vu tous les épisodes disponibles de $anime_title"
+    return 0
+}
+
+tui_history() {
+    while :; do
+        _list="$(tui_history_list)"
+        if [ -z "$_list" ]; then
+            warn "L'historique est vide, cherchez un anime pour commencer"
+            return 1
+        fi
+        ui_reset "Historique"
+        ui_input=1 ui_forget=1 ui_pv_cmd="--preview"
+        ui_header="$(tui_take_notice)"
+        ui_header="${ui_header:+$ui_header
+}${c_dim}Clic ou Entrée : reprendre à l'épisode suivant  ·  ctrl-d : retirer de l'historique${c_reset}"
+        _out="$(printf "%s\n" "$_list" | ui_menu)"
+        case "$_out" in
+            @home) tui_home ;;
+            @quit) exit 0 ;;
+            "") return 1 ;;
+            *) ;;
+        esac
+        _id="${_out%%	*}"
+        tui_resume "${_id#hist:}" && return 0
+    done
+}
+
+# SETTINGS
+
+config_set() {
+    _dir="${config_file%/*}"
+    [ -d "$_dir" ] || mkdir -p "$_dir"
+    {
+        [ -f "$config_file" ] && grep -v "^$1=" "$config_file"
+        [ -n "$2" ] && printf "%s=%s\n" "$1" "$2"
+    } >"$config_file.new"
+    mv "$config_file.new" "$config_file"
+}
+
+# the settings fill the variables the environment left unset
+load_config() {
+    [ -f "$config_file" ] || return 0
+    while IFS= read -r _line || [ -n "$_line" ]; do
+        _key="${_line%%=*}"
+        _value="${_line#*=}"
+        case "$_key" in
+            ANI_CLI_MODE | ANI_CLI_PROVIDER | ANI_CLI_QUALITY | ANI_CLI_PLAYER | ANI_CLI_SKIP_INTRO)
+                eval "[ -n \"\${$_key+x}\" ] || $_key=\$_value"
+                ;;
+            *) ;;
+        esac
+    done <"$config_file"
+}
+
+# (value \t label) lines of $2 with the one equal to $1 marked
+tui_options() {
+    printf "%s\n" "$2" | while IFS="	" read -r _value _label; do
+        if [ "$_value" = "$1" ]; then
+            printf "%s\t%s  ${c_seen}● actuel${c_reset}\n" "$_value" "$_label"
+        else
+            printf "%s\t%s\n" "$_value" "$_label"
+        fi
+    done
+}
+
+tui_setting_row() {
+    printf "%s\t%s  " "$1" "$2"
+    tui_pad "$3" 22
+    printf "%s%s%s\n" "$c_bold" "$4" "$c_reset"
+}
+
+tui_settings() {
+    while :; do
+        _lang="Demander à chaque fois"
+        [ "$lang_forced" = 1 ] && _lang="$(lang_label "$mode")"
+        _site="Tous"
+        [ "$provider" != "all" ] && _site="$(site_label "$provider")"
+        _skip="Non"
+        [ "$skip_intro" = 1 ] && _skip="Oui"
+        _hist_count="$(grep -c '' "$histfile")"
+        menu_header="Les choix sont enregistrés dans $config_file" menu_preview="" menu_start="${_row:-}"
+        [ "${config_file#"$HOME"/}" != "$config_file" ] && menu_header="Les choix sont enregistrés dans ~/${config_file#"$HOME"/}"
+        _choice="$({
+            tui_setting_row langue "⇄" "Langue" "$_lang"
+            tui_setting_row site "⌕" "Site" "$_site"
+            tui_setting_row qualite "◐" "Qualité" "$quality"
+            tui_setting_row lecteur "▶" "Lecteur vidéo" "${player_function##*/}"
+            tui_setting_row intro "»" "Passer les intros" "$_skip"
+            tui_setting_row effacer "✕" "Effacer l'historique" "$_hist_count séries"
+            printf "retour\t‹  Retour à l'accueil\n"
+        } | choose "Paramètres")"
+        # the cursor comes back on the setting just changed
+        _row=1
+        for _key in langue site qualite lecteur intro effacer; do
+            [ "$_key" = "$_choice" ] && break
+            _row=$((_row + 1))
+        done
+        case "$_choice" in
+            langue)
+                _current="ask"
+                [ "$lang_forced" = 1 ] && _current="$mode"
+                menu_header="Langue prise sans la demander, le menu des langues s'affiche quand elle manque"
+                _value="$(tui_options "$_current" "ask	Demander à chaque fois
+vostfr	VOSTFR
+vf	VF (si plusieurs VF existent, elles sont proposées)" | choose "Langue")"
+                case "$_value" in
+                    ask) config_set ANI_CLI_MODE "" && lang_forced=0 mode=vostfr ;;
+                    vostfr | vf) config_set ANI_CLI_MODE "$_value" && lang_forced=1 mode="$_value" ;;
+                    *) ;;
+                esac
+                ;;
+            site)
+                menu_header="Le site où chercher par défaut, la recherche permet aussi d'en changer"
+                _value="$(tui_options "$provider" "all	Tous (anime-sama + franime)
+animesama	anime-sama
+franime	franime" | choose "Site")"
+                [ -n "$_value" ] && config_set ANI_CLI_PROVIDER "$_value" && provider="$_value" && printf "%s" "$provider" >"$tui_dir/provider"
+                ;;
+            qualite)
+                menu_header="La qualité prise quand plusieurs sont proposées"
+                _value="$(tui_options "$quality" "best	La meilleure (best)
+1080p	1080p
+720p	720p
+480p	480p
+360p	360p
+worst	La plus basse (worst)" | choose "Qualité")"
+                [ -n "$_value" ] && config_set ANI_CLI_QUALITY "$_value" && quality="$_value"
+                ;;
+            lecteur)
+                menu_header="Lecteurs trouvés sur cet ordinateur"
+                _players=""
+                for _player in iina /Applications/IINA.app/Contents/MacOS/iina-cli mpv vlc celluloid; do
+                    command -v "$_player" >/dev/null 2>&1 || continue
+                    _players="$_players$_player	${_player##*/}
+"
+                done
+                if [ -z "$_players" ]; then
+                    warn "Aucun lecteur trouvé (iina, mpv ou vlc)"
+                    continue
+                fi
+                _value="$(tui_options "$player_function" "${_players%
+}" | choose "Lecteur vidéo")"
+                [ -n "$_value" ] && config_set ANI_CLI_PLAYER "$_value" && player_function="$_value"
+                ;;
+            intro)
+                menu_header="Saute le générique de début avec ani-skip (mpv uniquement)"
+                _value="$(tui_options "$skip_intro" "1	Oui
+0	Non" | choose "Passer les intros")"
+                if [ "$_value" = 1 ] && ! command -v ani-skip >/dev/null; then
+                    warn "ani-skip n'est pas installé : https://github.com/synacktraa/ani-skip"
+                elif [ -n "$_value" ]; then
+                    config_set ANI_CLI_SKIP_INTRO "$_value" && skip_intro="$_value"
+                fi
+                ;;
+            effacer)
+                menu_header="Effacer les $_hist_count séries de l'historique ?"
+                _value="$(printf "non\t‹  Annuler\noui\t✕  Oui, tout effacer\n" | choose "Effacer l'historique")"
+                [ "$_value" = "oui" ] && : >"$histfile" && note "Historique effacé"
+                ;;
+            *) return 0 ;;
+        esac
+    done
+}
+
+# HELP
+
+tui_help_topic() {
+    case "$1" in
+        demarrer) printf "%s\n" "Démarrer" "" \
+            "Lancez simplement ./ani-cli : tout se passe ensuite dans cette interface." "" \
+            "1. Rechercher : tapez un titre, les résultats d'anime-sama et de franime arrivent pendant la frappe." \
+            "2. Choisissez l'anime, puis la saison." \
+            "3. Choisissez la langue : VOSTFR, VF, ou une VF précise (VF Netflix, VF Crunchyroll…)." \
+            "4. Choisissez l'épisode : ceux déjà vus sont marqués ✓ vu." \
+            "5. La vidéo s'ouvre dans votre lecteur et le menu de lecture reste ici." "" \
+            "L'historique garde votre progression : « Reprendre » sur l'accueil lance l'épisode suivant." ;;
+        souris) printf "%s\n" "Souris et clavier" "" \
+            "Survol             surligner la ligne et afficher son aperçu" \
+            "Clic               choisir une ligne" \
+            "Molette            faire défiler" \
+            "Clic droit, Tab    sélectionner plusieurs épisodes" \
+            "↑ ↓                naviguer" \
+            "Entrée             choisir" \
+            "Échap              revenir en arrière" \
+            "F1                 cette aide, depuis n'importe quel écran" \
+            "ctrl-q             quitter" \
+            "ctrl-s             changer de site pendant la recherche" \
+            "ctrl-d             retirer un anime de l'historique" "" \
+            "Les boutons du bas (‹ Retour, ⌂ Accueil, ? Aide, ✕ Quitter) se cliquent." "" \
+            "Les animations se coupent avec ANI_CLI_ANIMATIONS=0." ;;
+        langues) printf "%s\n" "Langues et versions" "" \
+            "Après la saison, le menu de langue montre toutes les versions avec leur nombre d'épisodes." "" \
+            "Sur anime-sama, une saison peut avoir plusieurs VF : par exemple VF Crunchyroll et VF Netflix." \
+            "Ce sont parfois des doublages différents, parfois le même doublage sur un autre flux." "" \
+            "Pendant la lecture, « Changer de version » permet de passer de l'une à l'autre," \
+            "au même épisode quand il existe." "" \
+            "Dans les paramètres, une langue par défaut évite la question à chaque fois." ;;
+        lecteurs) printf "%s\n" "Lecteurs et sources" "" \
+            "Chaque épisode est proposé sur plusieurs lecteurs (sibnet, vidmoly, sendvid…)." \
+            "Le script les essaie dans l'ordre jusqu'à trouver une source lisible." "" \
+            "« Changer de lecteur » dans le menu de lecture les liste tous." \
+            "Le lecteur choisi est essayé en premier pour les épisodes suivants." "" \
+            "Si aucune source ne marche, le menu propose un autre lecteur, l'autre site," \
+            "une autre version ou un autre épisode." ;;
+        sites) printf "%s\n" "anime-sama et franime" "" \
+            "Les deux sites sont cherchés en même temps par défaut." \
+            "Pendant la recherche, cliquez sur un site en haut (ou ctrl-s) pour n'en garder qu'un." "" \
+            "Pendant la lecture, « Regarder sur … » cherche le même anime sur l'autre site" \
+            "et garde la langue et l'épisode quand ils existent." "" \
+            "Le domaine d'anime-sama change souvent : il est lu sur anime-sama.pw." ;;
+        historique) printf "%s\n" "Historique" "" \
+            "Chaque épisode lancé est noté, par saison et par langue." \
+            "Les derniers animes sont sur l'accueil, « Tout l'historique » montre le reste." "" \
+            "Entrée ou clic reprend à l'épisode suivant." \
+            "ctrl-d retire un anime de l'historique." \
+            "Les paramètres permettent de tout effacer." ;;
+        parametres) printf "%s\n" "Paramètres" "" \
+            "Langue par défaut, site, qualité, lecteur vidéo et passage des intros." \
+            "Ils sont enregistrés dans ~/.config/ani-cli-fr/config." \
+            "Les variables d'environnement (ANI_CLI_MODE, ANI_CLI_PLAYER…) restent prioritaires." ;;
+        cli) help_info ;;
+        *) ;;
+    esac
+}
+
+# the topics on the left, their text follows the pointer on the right. prints @home or @quit from the buttons
+tui_help() {
+    ui_reset "Aide"
+    ui_in_help=1 ui_pv_cmd="--tui-help-topic" ui_pv_title="Aide" ui_pv_split=32 ui_accept_only="retour"
+    _out="$(printf "%s\n" "demarrer	?  Démarrer" "souris	⌖  Souris et clavier" "langues	⇄  Langues et versions VF" \
+        "lecteurs	▶  Lecteurs et sources" "sites	⌕  anime-sama et franime" "historique	↻  Historique" \
+        "parametres	⚙  Paramètres" "cli	\$  Ligne de commande" "retour	‹  Retour" | ui_menu)"
+    case "$_out" in
+        @home | @quit) printf "%s\n" "$_out" ;;
+        *) ;;
+    esac
+}
+
+# HOME
+
+tui_home_menu() {
+    _recent="$(tui_history_list | head -n 4 | sed 's|	|	↻  |')"
+    _count="$(tui_history_list | grep -c '')"
+    ui_reset "Accueil"
+    ui_logo=1 ui_pv_cmd="--preview"
+    ui_header="$(tui_take_notice)"
+    {
+        printf "search\t⌕  Rechercher un anime\n"
+        [ -n "$_recent" ] && printf "%s\n" "$_recent"
+        [ "$_count" -gt 0 ] && printf "historique\t≡  Tout l'historique  ${c_dim}·  %s séries${c_reset}\n" "$_count"
+        printf "parametres\t⚙  Paramètres\n"
+        printf "aide\t?  Aide\n"
+        printf "quitter\t✕  Quitter\n"
+    } | ui_menu
+}
+
+tui_describe() {
+    case "$1" in
+        search) printf "%s\n" "Rechercher un anime" "" "Tapez un titre : les résultats d'anime-sama et de franime arrivent pendant la frappe." "" "Cliquez sur un site en haut de la recherche pour n'en garder qu'un." ;;
+        historique)
+            _count="$(grep -c '' "$histfile")"
+            printf "%s\n" "Tout l'historique" "" "$_count séries suivies." "Reprenez à l'épisode suivant ou retirez un anime avec ctrl-d."
+            ;;
+        parametres)
+            _lang="Demander à chaque fois"
+            [ -n "${ANI_CLI_MODE:-}" ] && _lang="$(lang_label "$ANI_CLI_MODE")"
+            printf "%s\n" "Paramètres" "" "Langue : $_lang" "Site : ${ANI_CLI_PROVIDER:-all}" "Qualité : ${ANI_CLI_QUALITY:-best}" "Lecteur : ${ANI_CLI_PLAYER:-détecté automatiquement}"
+            ;;
+        aide) printf "%s\n" "Aide" "" "Utilisation de l'interface, des langues, des lecteurs et des sites." "Disponible partout avec F1." ;;
+        quitter) printf "%s\n" "Quitter ani-cli-fr" "" "Les vidéos déjà ouvertes continuent dans leur lecteur." ;;
+        *) ;;
+    esac
+}
+
+tui_run() {
+    case "$source" in
+        history) tui_history && return 0 ;;
+        *) [ -n "$query" ] && user_query="$(printf "%s" "$query" | tr '+' ' ')" && tui_search_flow && return 0 ;;
+    esac
+    while :; do
+        user_query=""
+        _out="$(tui_home_menu)"
+        _choice="${_out%%	*}"
+        case "$_choice" in
+            search) tui_search_flow && return 0 ;;
+            hist:*) tui_resume "${_choice#hist:}" && return 0 ;;
+            historique) tui_history && return 0 ;;
+            parametres) tui_settings ;;
+            aide)
+                _after="$(tui_help)"
+                [ "$_after" = "@quit" ] && exit 0
+                ;;
+            @home) ;;
+            *) exit 0 ;;
+        esac
+    done
 }
 
 # MAIN
 
+tui=0
+
+# the help comes before any check, so it works even without a player or a connection
+for _arg in "$@"; do
+    case "$_arg" in
+        -h | --help) help_info ;;
+        *) ;;
+    esac
+done
+if [ "$#" -eq 1 ]; then
+    case "$1" in
+        help | aide) help_info ;;
+        *) ;;
+    esac
+fi
+
 # setup
-base_api="https://hianime.at"
-search_api="${base_api}/search?keyword=%s"
-episodes_api="${base_api}/api/theme/episode/list/%s"
-servers_api="${base_api}/api/theme/episode/servers?episodeId=%s"
+fr_api="https://api.franime.fr/api"
+as_base="${ANI_CLI_ANIMESAMA_URL:-}"
+as_base="${as_base%/}"
 ciphers='ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305'
 tls13_ciphers='TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256'
 agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
-mode="${ANI_CLI_MODE:-sub}"
+config_file="${ANI_CLI_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/ani-cli-fr/config}"
+load_config
+
+mode="${ANI_CLI_MODE:-vostfr}"
+provider="${ANI_CLI_PROVIDER:-all}"
 download_dir="${ANI_CLI_DOWNLOAD_DIR:-.}"
 log_episode="${ANI_CLI_LOG:-1}"
 quality="${ANI_CLI_QUALITY:-best}"
 exact_match="${ANI_CLI_EXACT:-0}"
 
-curl_exe=$(dep_ch_failover "curl_firefox135,curl_chrome136,curl_chrome116,curl_ff117,curl") || die "Program curl not found"
+curl_exe=$(dep_ch_failover "curl_firefox135,curl_chrome136,curl_chrome116,curl_ff117,curl") || die "Programme curl introuvable"
 
 case "$(uname -a | cut -d " " -f 1,3-)" in
     *Darwin*)
         cipher_flag="--ciphers $ciphers --tls13-ciphers $tls13_ciphers"
-        player_function="${ANI_CLI_PLAYER:-$(dep_ch_failover "iina,/Applications/IINA.app/Contents/MacOS/iina-cli,mpv,vlc")}" || die 'No player found. Looked for iina, mpv and vlc'
+        player_function="${ANI_CLI_PLAYER:-$(dep_ch_failover "iina,/Applications/IINA.app/Contents/MacOS/iina-cli,mpv,vlc")}" || die 'Aucun lecteur trouvé. Recherché : iina, mpv et vlc'
         ;;                                                            # mac OS
     *ndroid*) player_function="${ANI_CLI_PLAYER:-android_mpv}" ;;     # Android OS (termux)
     *MINGW* | *WSL2*) player_function="${ANI_CLI_PLAYER:-mpv.exe}" ;; # Windows OS
     *ish*)
         player_function="${ANI_CLI_PLAYER:-iSH}"
         curl_exe=$(dep_ch_failover "curl_safari260_ios,$curl_exe")
-        ;;                                                                                                                                                                                               # iOS (iSH)
-    *) player_function="${ANI_CLI_PLAYER:-$(dep_ch_failover "mpv,$HOME/.local/share/flatpak/app/io.mpv.Mpv/,/var/lib/flatpak/app/io.mpv.Mpv/,vlc")}" || die 'No player found. Looked for mpv and vlc' ;; # Linux OS
+        ;;                                                                                                                                                                                                    # iOS (iSH)
+    *) player_function="${ANI_CLI_PLAYER:-$(dep_ch_failover "mpv,$HOME/.local/share/flatpak/app/io.mpv.Mpv/,/var/lib/flatpak/app/io.mpv.Mpv/,vlc")}" || die 'Aucun lecteur trouvé. Recherché : mpv et vlc' ;; # Linux OS
 esac
 
 player_extra_flags="${ANI_CLI_PLAYER_FLAGS:-""}"
@@ -486,6 +3120,39 @@ hist_dir="${ANI_CLI_HIST_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ani-cli}"
 [ ! -d "$hist_dir" ] && mkdir -p "$hist_dir"
 histfile="$hist_dir/ani-hsts"
 [ ! -f "$histfile" ] && : >"$histfile"
+
+cache_dir="${ANI_CLI_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/ani-cli}"
+[ ! -d "$cache_dir" ] && mkdir -p "$cache_dir"
+
+# fzf runs the script again to fill the preview of the highlighted line and for the live parts of the full screen interface
+case "$1" in
+    --preview | --tui-*)
+        tui_dir="${ANI_CLI_TUI_DIR:-}"
+        set_colors
+        _id="$2"
+        case "$_id" in
+            hist:*)
+                hist_split "${_id#hist:}"
+                _id="$hist_anime"
+                ;;
+            *) ;;
+        esac
+        case "$1:$_id" in
+            --preview:as:*) as_resolve_domain 2>/dev/null && preview_anime "$_id" ;;
+            --preview:fr:*) preview_anime "$_id" ;;
+            --preview:*) tui_describe "$_id" ;;
+            --tui-search:*) tui_search_results "$2" ;;
+            --tui-help-topic:*) tui_help_topic "$2" ;;
+            *) ;;
+        esac
+        exit 0
+        ;;
+    *) ;;
+esac
+
+# the language is asked unless it was chosen beforehand
+lang_forced=0
+[ -n "${ANI_CLI_MODE:-}" ] && lang_forced=1
 
 source="${ANI_CLI_DEFAULT_SOURCE:-search}"
 branch="${ANI_CLI_BRANCH:-master}"
@@ -511,13 +3178,18 @@ while [ $# -gt 0 ]; do
             esac
             ;;
         -q | --quality)
-            [ $# -lt 2 ] && die "missing argument!"
+            [ $# -lt 2 ] && die "argument manquant !"
             quality="$2"
             shift
             ;;
         -S | --select-nth)
-            [ $# -lt 2 ] && die "missing argument!"
+            [ $# -lt 2 ] && die "argument manquant !"
             index="$2"
+            shift
+            ;;
+        -p | --provider)
+            [ $# -lt 2 ] && die "argument manquant !"
+            provider="$2"
             shift
             ;;
         -c | --continue) source=history ;;
@@ -532,18 +3204,19 @@ while [ $# -gt 0 ]; do
             case "$(uname -s)" in
                 Darwin*) log show --predicate 'process == "logger"' ;;
                 Linux*) journalctl -t ani-cli ;;
-                *) die "Logger not implemented for your platform" ;;
+                *) die "Logs non disponibles sur votre plateforme" ;;
             esac
             exit 0
             ;;
         -V | --version) version_info ;;
         -h | --help) help_info ;;
         -e | --episode | -r | --range)
-            [ $# -lt 2 ] && die "missing argument!"
+            [ $# -lt 2 ] && die "argument manquant !"
             ep_no="$2"
             shift
             ;;
-        --dub) mode="dub" ;;
+        --vf | --dub) mode="vf" lang_forced=1 ;;
+        --vostfr | --sub) mode="vostfr" lang_forced=1 ;;
         --no-detach) no_detach=1 ;;
         --exit-after-play) exit_after_play=1 && no_detach=1 ;;
         --rofi) menu_program=rofi ;;
@@ -560,10 +3233,25 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+case "$mode" in
+    sub | vo | vostfr) mode="vostfr" ;;
+    dub | vf) mode="vf" ;;
+    vf[0-9] | vf[0-9][0-9]) ;;
+    *) die "Langue inconnue : $mode (vostfr, vf, vf1, vf2…)" ;;
+esac
+# an episode given on the command line means a scripted run, nothing is asked about the language
+[ -n "$ep_no" ] && lang_forced=1
+
+case "$provider" in
+    all) ;;
+    as | anime-sama | animesama) provider="animesama" ;;
+    fr | franime) provider="franime" ;;
+    *) die "Site inconnu : $provider (all, animesama ou franime)" ;;
+esac
+
 [ "$menu_program" = "fzf" ] && menu_multi_flag="-m"
 [ "$menu_program" = "rofi" ] && menu_multi_flag="-multi-select"
 
-info "Checking dependencies..."
 dep_ch "sed"
 dep_ch "grep"
 [ "$skip_intro" = 1 ] && dep_ch "ani-skip"
@@ -571,9 +3259,9 @@ dep_ch "$menu_program" # TODO: use dep_ch_failover to iterate through options
 
 case "$player_function" in
     debug) ;;
-    download) dep_ch_failover "yt-dlp,ffmpeg" >/dev/null || die 'Neither yt-dlp nor ffmpeg found' ;;
-    android*) printf "\33[2K\rChecking of players on Android is disabled.\nmpv needs include=\"/storage/emulated/0/mpv/mpv.config.mp4\" in its mpv.conf, see the readme.\n" ;;
-    *iSH*) printf "\33[2K\rChecking of players on iOS is disabled\n" ;;
+    download) dep_ch_failover "yt-dlp,ffmpeg" >/dev/null || die 'Ni yt-dlp ni ffmpeg trouvé' ;;
+    android*) printf "\33[2K\rLa vérification des lecteurs est désactivée sur Android.\nmpv a besoin de include=\"/storage/emulated/0/mpv/mpv.config.mp4\" dans son mpv.conf, voir le readme.\n" ;;
+    *iSH*) printf "\33[2K\rLa vérification des lecteurs est désactivée sur iOS\n" ;;
     *flatpak*mpv*) dep_ch "flatpak" ;;
     *) dep_ch "$player_function" ;;
 esac
@@ -581,85 +3269,232 @@ esac
 # idk where to put this, so I put it here...
 trap 'cleanup; exit 1' INT HUP TERM
 
+# the history may hold anime-sama entries whatever the provider is
+{ [ "$provider" != "franime" ] || [ "$source" = "history" ]; } && as_resolve_domain
+
+if [ "$menu_program" = "fzf" ]; then
+    fzf_setup
+    set_colors
+fi
+menu_preview_cmd="sh '$0' --preview {1}"
+
+# the full screen interface unless the run is scripted or the terminal cannot show it
+if [ "$menu_program" = "fzf" ] && [ "${ANI_CLI_TUI:-1}" != 0 ] && [ -t 0 ] && [ -t 1 ] && [ -t 2 ] &&
+    [ -z "$ep_no" ] && [ -z "$index" ] && [ "$source" != "nextep" ] && [ "$no_detach" = 0 ]; then
+    case "$player_function" in
+        debug | download) ;;
+        *) tui_init "$provider" && tui=1 ;;
+    esac
+fi
+
+# prints the label of the (value \t label) line of $1 whose value is $2
+label_of() {
+    printf "%s\n" "$1" | while IFS="	" read -r _value _label _rest; do
+        [ "$_value" = "$2" ] && printf "%s\n" "$_label" && break
+    done
+}
+
+[ "$tui" != 1 ] && [ -t 2 ] && [ "$source" != "nextep" ] && banner >&2
+
 # searching
-case "$source" in
-    history)
-        backup_old_hist
-        anime_list=$(while read -r ep_no anime_id anime_title; do process_hist_entry & done <"$histfile")
-        wait
-        [ -z "$anime_list" ] && die "No unwatched series in history!"
-        [ -z "${index##*[!0-9]*}" ] && anime_id=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select anime: " | cut -f 1)
-        [ -z "${index##*[!0-9]*}" ] || anime_id=$(printf "%s" "$anime_list" | sed -n "${index}p" | cut -f 1)
-        [ -z "$anime_id" ] && exit 1
-        anime_title=$(printf "%s" "$anime_list" | grep "^$anime_id	" | cut -f 2 | sed 's| - episode.*||')
-        episode_maps="$(hianime_episodes "$anime_id")" || exit 1
-        ep_list="$(printf "%s" "$episode_maps" | cut -f 2)"
-        ep_no=$(printf "%s" "$anime_list" | grep "^$anime_id	" | sed -nE 's/.*- episode (.+)$/\1/p')
-        ;;
-    *)
-        if [ "$menu_program" = "fzf" ]; then
-            while [ -z "$query" ]; do
-                printf "\33[2K\r\033[1;36mSearch anime: \033[0m" && read -r query
-            done
-        else
-            [ -z "$query" ] && query=$(: | menu "Search anime: " "" "$menu_extra_flags")
-            [ -z "$query" ] && exit 1
-        fi
-        # for checking new releases by specifying anime name
-        [ "$source" = "nextep" ] && time_until_next_ep "$query"
 
-        user_query="$(printf "%s" "$query" | tr '+' ' ')"
-        query=$(printf "%s" "$query" | sed 's| |+|g')
-
-        anime_list=$(hianime_search "$query") || exit 1
-        [ -z "$anime_list" ] && die "No results found!"
-        if [ "$exact_match" = 1 ]; then
+# the search, the results and the seasons. leaving the season or language menu goes back to the results
+search_flow() {
+    while :; do
+        status "Recherche de « $user_query »…"
+        anime_list="$(search_anime "$query")"
+        if [ "$exact_match" = 1 ] && [ -n "$anime_list" ]; then
             _query_norm="$(printf "%s" "$user_query" | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//')"
-            anime_list="$(printf "%s\n" "$anime_list" | while IFS="$(printf '\t')" read -r _id _title; do
+            anime_list="$(printf "%s\n" "$anime_list" | while IFS="	" read -r _id _title; do
                 _title_norm="$(printf "%s" "$_title" | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//')"
                 [ "$_title_norm" = "$_query_norm" ] && printf "%s\t%s\n" "$_id" "$_title"
             done)"
-            [ -z "$anime_list" ] && die "No exact match found for '$user_query'!"
         fi
-        [ "$index" -eq "$index" ] 2>/dev/null && result=$(printf "%s" "$anime_list" | sed -n "${index}p")
-        [ -z "$index" ] && result=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select anime: ")
-        [ -z "$result" ] && die "Invalid anime selection"
-        anime_title="$(printf "%s" "$result" | cut -f 2)"
-        anime_id="$(printf "%s" "$result" | cut -f 1)"
-        episode_maps="$(hianime_episodes "$anime_id")" || exit 1
-        ep_list="$(printf '%s' "$episode_maps" | cut -f 2)"
-        [ -z "$ep_no" ] && ep_no=$(printf "%s" "$ep_list" | nth "Select episode: " "$menu_multi_flag")
-        [ -z "$ep_no" ] && die "Invalid episode selection"
+        if [ -z "$anime_list" ]; then
+            _where=""
+            [ "$provider" != "all" ] && _where=" sur $(site_label "$provider")"
+            warn "Aucun résultat pour « $user_query »$_where"
+            menu_header="Aucun résultat pour « $user_query »$_where" menu_preview="" menu_start=""
+            _choice="$({
+                # the other site is offered once per query
+                [ "$_switched" != 1 ] && [ "$provider" = "animesama" ] && printf "franime\t⌕  Chercher sur franime\n"
+                [ "$_switched" != 1 ] && [ "$provider" = "franime" ] && printf "animesama\t⌕  Chercher sur anime-sama\n"
+                printf "recherche\t❯  Nouvelle recherche\n"
+                printf "quitter\t✕  Quitter\n"
+            } | choose "Que faire ?")"
+            case "$_choice" in
+                franime | animesama) provider="$_choice" _switched=1 ;;
+                recherche) ask_query "Rechercher un anime" && _switched=0 || return 1 ;;
+                *) return 1 ;;
+            esac
+            continue
+        fi
+        _single=0
+        _count="$(printf "%s\n" "$anime_list" | grep -c '')"
+        [ "$_count" -eq 1 ] && _single=1
+        while :; do
+            _header="$(result_count) pour « $user_query »"
+            pick_anime "$_header" || return 1
+            pick_season
+            _status=$?
+            [ "$_status" = 0 ] && return 0
+            if [ "$_status" = 1 ]; then
+                [ "$_single" = 1 ] && return 1
+                continue
+            fi
+            # nothing to watch here, the other site may have it
+            _site="$(other_site)"
+            _site="$(site_label "$_site")"
+            menu_header="Rien à regarder pour $anime_title" menu_preview="" menu_start=""
+            _choice="$({
+                printf "site\t⌕  Chercher « %s » sur %s\n" "$base_title" "$_site"
+                [ "$_single" = 0 ] && printf "retour\t‹  Revenir aux résultats\n"
+                printf "recherche\t❯  Nouvelle recherche\n"
+                printf "quitter\t✕  Quitter\n"
+            } | choose "Que faire ?")"
+            case "$_choice" in
+                site) find_on_other_site && return 0 ;;
+                retour) ;;
+                recherche)
+                    ask_query "Rechercher un anime" || return 1
+                    break
+                    ;;
+                *) return 1 ;;
+            esac
+        done
+    done
+}
+
+[ "$tui" = 1 ] && backup_old_hist && tui_run
+[ "$tui" = 1 ] || case "$source" in
+    history)
+        backup_old_hist
+        status "Lecture de l'historique…"
+        anime_list="$(
+            while IFS="	" read -r ep_no anime_id anime_title; do
+                process_hist_entry &
+            done <"$histfile"
+            wait
+        )"
+        [ -z "$anime_list" ] && die "Aucune série en cours dans l'historique !"
+        if [ -z "${index##*[!0-9]*}" ]; then
+            menu_header="Reprendre une série" menu_preview="$menu_preview_cmd" menu_start=""
+            hist_id="$(printf "%s\n" "$anime_list" | choose "Reprendre")"
+        else
+            hist_id="$(printf "%s\n" "$anime_list" | sed -n "${index}p" | cut -f 1)"
+        fi
+        [ -z "$hist_id" ] && exit 1
+        _entry="$(printf "%s\n" "$anime_list" | while IFS="	" read -r _id _label _next _title; do
+            [ "$_id" = "$hist_id" ] && printf "%s\t%s\n" "$_next" "$_title" && break
+        done)"
+        ep_no="${_entry%%	*}"
+        anime_title="${_entry#*	}"
+        base_title="${anime_title% - *}"
+        hist_split "$hist_id"
+        anime_id="$hist_anime"
+        case "$anime_id" in
+            fr:*) _fr_id="${anime_id#fr:}" && fr_cache_anime "${_fr_id%/*}" ;;
+            *) ;;
+        esac
+        if ! use_language "$hist_lang"; then
+            _site="$(site_label "$anime_id")"
+            warn "Impossible de récupérer les épisodes de $anime_title sur $_site"
+            mode="$hist_lang"
+            find_on_other_site || exit 1
+        fi
+        ;;
+    *)
+        [ -n "$query" ] || ask_query "Rechercher un anime" || exit 1
+        # for checking new releases by specifying anime name
+        [ "$source" = "nextep" ] && time_until_next_ep "$query"
+        user_query="$(printf "%s" "$query" | tr '+' ' ')"
+        query="$(printf "%s" "$query" | sed 's| |+|g')"
+        search_flow || exit 1
         ;;
 esac
+[ -z "$ep_no" ] && ep_no="$(choose_episode)"
+if [ -z "$ep_no" ]; then
+    [ "$tui" = 1 ] && tui_home
+    exit 1
+fi
 
-# moves the cursor up one line and clears that line
-tput cuu1 && tput el
-# stores the position of cursor
-tput sc
+if [ "$tui" != 1 ]; then
+    # moves the cursor up one line and clears that line
+    tput cuu1 && tput el
+    # stores the position of cursor
+    tput sc
+fi
 
 # playback & loop
-play
+playing=1
+play_failed=0
+if ! play; then
+    # without a menu to fall back on, a failure ends the run
+    [ "$player_function" = "download" ] || [ "$player_function" = "debug" ] || [ "$exit_after_play" = 1 ] && exit 1
+    play_failed=1
+fi
 [ "$player_function" = "download" ] || [ "$player_function" = "debug" ] && exit 0
 
-while cmd=$(printf "next\nreplay\nprevious\nselect\nchange_quality\nquit" | nth "Playing episode $ep_no of $anime_title... "); do
+while :; do
+    cmd="$(playback_menu)"
     case "$cmd" in
-        next) ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{n;p;}") 2>/dev/null ;;
-        replay) video_link="$replay" ;;
-        previous) ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{g;1!p;};h") 2>/dev/null ;;
-        select) ep_no=$(printf "%s" "$ep_list" | nth "Select episode: " "$menu_multi_flag") ;;
-        change_quality)
-            new_quality="$(printf "%s" "$links" | menu "Select Quality: " "" "$menu_extra_flags" | cut -d ">" -f 1)"
-            [ -z "$new_quality" ] && die "No quality selected"
-            select_quality "$new_quality"
+        suivant) ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{n;p;}") 2>/dev/null ;;
+        rejouer) video_link="$replay" ;;
+        précédent) ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{g;1!p;};h") 2>/dev/null ;;
+        choisir)
+            _choice="$(choose_episode)"
+            [ -z "$_choice" ] && continue
+            ep_no="$_choice"
+            ;;
+        langue)
+            _versions="$(lang_count)"
+            if [ "$_versions" -gt 2 ]; then
+                language_menu "Changer de version" current || continue
+            else
+                _other="$(other_language)"
+                use_language "$_other"
+            fi
+            # the same episode in the other version when it exists
+            if ! printf "%s\n" "$ep_list" | grep -q -x -F -- "$ep_no"; then
+                _choice="$(choose_episode)"
+                [ -z "$_choice" ] && continue
+                ep_no="$_choice"
+            fi
+            ;;
+        lecteur)
+            _choice="$(choose_player)"
+            [ -z "$_choice" ] && continue
+            forced_player="$_choice"
+            # the host stays first for the next episodes
+            _players="$(list_players "$ep_no")"
+            _host_name="$(label_of "$_players" "$_choice")"
+            preferred_player="$(printf "%s" "${_host_name%%.*}" | tr '[:upper:]' '[:lower:]')"
+            ;;
+        qualité)
+            menu_header="Qualité actuelle : $current_quality" menu_preview="" menu_start=""
+            _choice="$(printf "%s\n" "$links" | sed -n 's|^\([^ >]*\) >.*|\1	\1|p' | choose "Choisir la qualité")"
+            [ -z "$_choice" ] && continue
+            select_quality "$_choice"
+            ;;
+        site) find_on_other_site || continue ;;
+        accueil) tui_home ;;
+        "")
+            # escape goes back home in the full screen interface
+            [ "$tui" = 1 ] && tui_home
+            cleanup
+            exit 0
             ;;
         *)
             cleanup
             exit 0
             ;;
     esac
-    [ -z "$ep_no" ] && die "Out of range"
-    play
+    [ -z "$ep_no" ] && die "Hors limites"
+    if play; then
+        play_failed=0
+    else
+        play_failed=1
+    fi
 done
 
 # ani-cli
@@ -677,4 +3512,4 @@ done
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 #
-# Project repository: https://github.com/pystardust/ani-cli
+# Project repository: https://github.com/scorpion7slayer/ani-cli-fr
