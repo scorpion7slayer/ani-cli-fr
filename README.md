@@ -28,8 +28,84 @@
 </p>
 
 <h3 align="center">
-A cli to browse and watch anime (alone AND with friends). This tool scrapes the site <a href="https://hianime.at/">hianime.</a>
+Un cli pour chercher et regarder des animes en VOSTFR ou en VF (seul ET entre amis). Cette version récupère les vidéos sur <a href="https://anime-sama.pw/">anime-sama</a> et <a href="https://franime.fr/">franime</a>.
 </h3>
+
+## Version française
+
+Cette version d'ani-cli cherche sur deux sites français :
+
+- **anime-sama** : son nom de domaine change souvent, le script lit donc le lien officiel sur [anime-sama.pw](https://anime-sama.pw/) et suit les redirections. Le domaine trouvé est gardé un jour en cache. Pour forcer un domaine, définissez `ANI_CLI_ANIMESAMA_URL` (par ex. `https://anime-sama.to`).
+- **franime** : le catalogue complet est téléchargé (environ 11 Mo) puis indexé en cache pendant un jour. La recherche fonctionne aussi avec les titres français.
+
+### Interface plein écran
+
+Lancez simplement `ani-cli`, sans rien d'autre : tout se passe ensuite dans une interface plein écran, à la souris ou au clavier.
+
+- **Accueil** : rechercher un anime, reprendre l'un des derniers animes regardés, l'historique complet, les paramètres et l'aide ;
+- **recherche en direct** : les résultats arrivent pendant la frappe, avec un aperçu à droite. Cliquez sur un site en haut (ou `ctrl-s`) pour chercher sur les deux sites ou sur un seul ;
+- **historique** : reprend à l'épisode suivant, `ctrl-d` retire un anime ;
+- **paramètres** : langue par défaut, site, qualité, lecteur vidéo, passage des intros, effacement de l'historique. Ils sont enregistrés dans `~/.config/ani-cli-fr/config` ;
+- **aide** : disponible partout avec `F1`.
+
+La ligne sous la souris est surlignée et son aperçu s'affiche au survol ; un clic la choisit, la molette fait défiler, `Échap` revient en arrière. Les boutons du bas (‹ Retour, ⌂ Accueil, ? Aide, ✕ Quitter) et les sites de la recherche s'allument au survol et se cliquent, et `ctrl-q` quitte. Dans la liste des épisodes, le clic droit ou `Tab` en coche plusieurs.
+
+L'interface est animée : logo en dégradé, apparition des lignes en cascade, curseur qui pulse, écran de chargement pendant la recherche des sources. `ANI_CLI_ANIMATIONS=0` coupe les animations.
+
+L'interface plein écran est dessinée par le script lui-même, quelle que soit la version de fzf, et suit la taille du terminal ; l'aperçu se masque sous 70 colonnes. Elle n'est pas utilisée pour les lancements scriptés (`-e`, `-S`, `-d`, `--no-detach`), avec rofi ou dmenu, ou avec `ANI_CLI_TUI=0` : les menus classiques s'affichent alors.
+
+### Parcours
+
+Les résultats des deux sites sont mélangés, avec le nom du site en couleur. Le parcours est le suivant :
+
+1. **anime** : un aperçu à droite affiche le synopsis, le format, le statut et les genres ;
+2. **saison** (ou film, saga…) ;
+3. **langue** : VOSTFR, VF et, sur anime-sama, les autres doublages quand il y en a plusieurs (par ex. « VF Crunchyroll » et « VF Netflix » pour Dandadan), chacun avec son nombre d'épisodes. Le menu ne s'affiche pas si une seule version existe ;
+4. **épisode** : les épisodes déjà vus sont cochés et le curseur se place sur le suivant. `Tab` permet d'en choisir plusieurs.
+
+Pendant la lecture, le menu propose :
+
+- l'épisode suivant ou précédent, de rejouer ou de choisir un autre épisode ;
+- de **passer en VF ou en VOSTFR**, ou de choisir une autre version de VF, sans quitter ;
+- de **changer de lecteur** : chaque épisode est souvent proposé sur plusieurs lecteurs (Vidmoly, Sibnet, Sendvid…). Le lecteur choisi passe en premier pour les épisodes suivants ;
+- de changer de qualité ;
+- de **regarder sur l'autre site** (anime-sama ↔ franime) : l'anime y est recherché, la langue et l'épisode sont gardés quand ils existent.
+
+Quand aucune source ne fonctionne, le menu propose directement d'essayer un autre lecteur, l'autre site, une autre version ou un autre épisode. Sans résultat de recherche, il propose de chercher sur l'autre site ; quand un anime n'a ni saison ni épisode, de le chercher sur l'autre site ou de revenir aux résultats.
+
+L'historique (`-c`) est tenu séparément pour chaque langue.
+
+### Ligne de commande
+
+Les options restent disponibles pour aller plus vite ou pour les scripts :
+
+```sh
+ani-cli                         # interface plein écran
+ani-cli frieren                 # ouvre directement la recherche de « frieren »
+ani-cli -c                      # ouvre l'historique
+ani-cli --vf naruto             # VF directement
+ani-cli --vf -e 3 naruto        # VF, épisode 3 (avec -e, la langue n'est jamais demandée : VOSTFR par défaut)
+ani-cli -p franime one piece    # seulement franime
+ani-cli -p animesama -q 720p jujutsu kaisen
+```
+
+| Option / variable | Rôle |
+| --- | --- |
+| `help`, `-h`, `--help` | affiche l'aide complète en français (options, menus, variables, exemples) |
+| `--vf` (`--dub`), `--vostfr` (`--sub`), `ANI_CLI_MODE` | langue à utiliser sans la demander : `vostfr`, `vf` (s'il y a plusieurs VF, elles sont proposées), `vf1`, `vf2`… |
+| `-p`, `--provider`, `ANI_CLI_PROVIDER` | `all` (par défaut), `animesama` ou `franime` |
+| `ANI_CLI_CACHE_DIR` | dossier du cache (par défaut `~/.cache/ani-cli`) |
+| `ANI_CLI_ANIMESAMA_URL` | domaine anime-sama à utiliser sans passer par anime-sama.pw |
+| `ANI_CLI_FZF_HEIGHT` | hauteur des menus fzf classiques (par défaut `90%`, les petits menus s'ajustent à leur contenu) |
+| `ANI_CLI_TUI` | `0` pour ne pas utiliser l'interface plein écran |
+| `ANI_CLI_ANIMATIONS` | `0` pour couper les animations de l'interface plein écran |
+| `ANI_CLI_CONFIG` | fichier des paramètres (par défaut `~/.config/ani-cli-fr/config`) ; les variables d'environnement restent prioritaires |
+
+Les cadres, les titres de menu et les aperçus demandent fzf 0.36 ou plus récent ; avec une version plus ancienne, les menus restent fonctionnels mais plus simples. rofi et dmenu restent pris en charge, sans aperçu.
+
+Lecteurs pris en charge, essayés dans cet ordre : Vidmoly/Ansembed, Smoothpre (famille VidHide), Uqload, VOE, Sibnet, Sendvid. Filemoon, VK et Embed4me ne sont pas pris en charge : un épisode disponible uniquement sur ces lecteurs ne pourra pas être lu. Sibnet et Sendvid bloquent certains pays, le script passe alors au lecteur suivant.
+
+L'historique des anciennes sources anglaises ne peut plus être repris, il est déplacé dans `ani-hsts.old`.
 
 <h1 align="center">
 	Showcase
